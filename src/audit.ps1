@@ -285,12 +285,22 @@ try {
         New-Item -ItemType Directory -Path $outputPath | Out-Null
     }
     
-    $packages1 | Export-Csv -Path (Join-Path $outputPath "Packages1_$ReviewID.csv") -NoTypeInformation
-    $packageMembers1 | Export-Csv -Path (Join-Path $outputPath "PackageMembers1_$ReviewID.csv") -NoTypeInformation
-    $packages2 | Export-Csv -Path (Join-Path $outputPath "Packages2_$ReviewID.csv") -NoTypeInformation
-    $privilegeGroups | Export-Csv -Path (Join-Path $outputPath "PrivilegeGroups_$ReviewID.csv") -NoTypeInformation
+    # Replace {ReviewId} in filenames
+    $packages1File = $config.OutputFiles.Packages1 -replace '{ReviewId}', $ReviewID
+    $packageMembers1File = $config.OutputFiles.PackageMembers1 -replace '{ReviewId}', $ReviewID
+    $packages2File = $config.OutputFiles.Packages2 -replace '{ReviewId}', $ReviewID
+    $privilegeGroupsFile = $config.OutputFiles.PrivilegeGroups -replace '{ReviewId}', $ReviewID
     
-    Write-Host "Processing completed successfully. Output files have been created in the output directory."
+    $packages1 | Export-Csv -Path (Join-Path $outputPath $packages1File) -NoTypeInformation
+    $packageMembers1 | Export-Csv -Path (Join-Path $outputPath $packageMembers1File) -NoTypeInformation
+    $packages2 | Export-Csv -Path (Join-Path $outputPath $packages2File) -NoTypeInformation
+    $privilegeGroups | Export-Csv -Path (Join-Path $outputPath $privilegeGroupsFile) -NoTypeInformation
+    
+    Write-Host "Processing completed successfully. Output files have been created in the output directory:"
+    Write-Host "  - $packages1File"
+    Write-Host "  - $packageMembers1File"
+    Write-Host "  - $packages2File"
+    Write-Host "  - $privilegeGroupsFile"
 }
 catch {
     Write-Error "An error occurred: $_"

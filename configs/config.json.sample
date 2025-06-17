@@ -11,5 +11,11 @@
       "Password": "",
       "Domain": ""
     }
+  },
+  "OutputFiles": {
+    "Packages1": "Packages1_{ReviewId}.csv",
+    "PackageMembers1": "PackageMembers1_{ReviewId}.csv",
+    "Packages2": "Packages2_{ReviewId}.csv",
+    "PrivilegeGroups": "PrivilegeGroups_{ReviewId}.csv"
   }
 }
