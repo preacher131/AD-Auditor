@@ -24,18 +24,11 @@ $privilegeConfig = Get-Content (Join-Path $configPath "privilege.json") | Conver
 # Function to establish AD connection
 function Connect-AD {
     $server = $config.DomainController
-    $port = $config.Connection.Port
     
-    # Build connection string based on LDAP/LDAPS
+    # Build server string based on LDAPS/LDAP
     if ($config.Connection.UseLDAPS) {
-        $protocol = "LDAPS"
-        $port = 636
-    } else {
-        $protocol = "LDAP"
-        $port = 389
+        $server = "$server:636"
     }
-    
-    $connectionString = "$protocol`://$server`:$port"
     
     # Handle credentials
     if ($config.Connection.UseCurrentUser) {
@@ -51,24 +44,19 @@ function Connect-AD {
     }
     
     # Set AD connection parameters
-    $adParams = @{
-        Server = $server
-        Protocol = $protocol
-        Port = $port
-    }
-    
+    $adParams = @{ Server = $server }
     if ($credential) {
-        $adParams.Add('Credential', $credential)
+        $adParams.Credential = $credential
     }
     
     # Test connection
     try {
         $testConnection = Get-ADDomain @adParams
-        Write-Verbose "Successfully connected to $connectionString"
+        Write-Verbose "Successfully connected to $server"
         return $adParams
     }
     catch {
-        Write-Error "Failed to connect to $connectionString : $_"
+        Write-Error "Failed to connect to $server : $_"
         exit 1
     }
 }
