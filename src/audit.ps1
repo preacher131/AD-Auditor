@@ -21,6 +21,58 @@ $config = Get-Content (Join-Path $configPath "config.json") | ConvertFrom-Json
 $groupsConfig = Get-Content (Join-Path $configPath "groups.json") | ConvertFrom-Json
 $privilegeConfig = Get-Content (Join-Path $configPath "privilege.json") | ConvertFrom-Json
 
+# Function to establish AD connection
+function Connect-AD {
+    $server = $config.DomainController
+    $port = $config.Connection.Port
+    
+    # Build connection string based on LDAP/LDAPS
+    if ($config.Connection.UseLDAPS) {
+        $protocol = "LDAPS"
+        $port = 636
+    } else {
+        $protocol = "LDAP"
+        $port = 389
+    }
+    
+    $connectionString = "$protocol`://$server`:$port"
+    
+    # Handle credentials
+    if ($config.Connection.UseCurrentUser) {
+        Write-Verbose "Using current user credentials"
+        $credential = $null
+    } else {
+        Write-Verbose "Using specified credentials"
+        $securePassword = ConvertTo-SecureString $config.Connection.CredentialProfile.Password -AsPlainText -Force
+        $credential = New-Object System.Management.Automation.PSCredential(
+            "$($config.Connection.CredentialProfile.Domain)\$($config.Connection.CredentialProfile.Username)",
+            $securePassword
+        )
+    }
+    
+    # Set AD connection parameters
+    $adParams = @{
+        Server = $server
+        Protocol = $protocol
+        Port = $port
+    }
+    
+    if ($credential) {
+        $adParams.Add('Credential', $credential)
+    }
+    
+    # Test connection
+    try {
+        $testConnection = Get-ADDomain @adParams
+        Write-Verbose "Successfully connected to $connectionString"
+        return $adParams
+    }
+    catch {
+        Write-Error "Failed to connect to $connectionString : $_"
+        exit 1
+    }
+}
+
 # Initialize output arrays
 $packages1 = @()
 $packageMembers1 = @()
@@ -30,7 +82,8 @@ $privilegeGroups = @()
 # Function to extract owner names using regex patterns
 function Get-OwnerNames {
     param(
-        [string]$Info
+        [string]$Info,
+        [hashtable]$ADParams
     )
     
     $primaryOwner = $null
@@ -52,7 +105,7 @@ function Get-OwnerNames {
             $lastName = $matches[2]
             
             # Search AD for matching user
-            $users = Get-ADUser -Filter "Surname -eq '$lastName'" -Properties mail
+            $users = Get-ADUser -Filter "Surname -eq '$lastName'" -Properties mail @ADParams
             $user = $users | Where-Object { $_.GivenName -eq $firstName } | Select-Object -First 1
             
             if ($user) {
@@ -107,8 +160,12 @@ function Get-DeterministicGuid {
 
 # Function to process groups
 function Process-Groups {
+    param(
+        [hashtable]$ADParams
+    )
+    
     foreach ($groupConfig in $groupsConfig.groups) {
-        $groups = Get-ADGroup -Filter * -SearchBase $groupConfig.path -Properties Description, info, member
+        $groups = Get-ADGroup -Filter * -SearchBase $groupConfig.path -Properties Description, info, member @ADParams
         
         foreach ($group in $groups) {
             $logicalInfo = $null
@@ -116,7 +173,7 @@ function Process-Groups {
                 $logicalInfo = Get-LogicalGroupInfo -GroupName $group.Name -LogicalGrouping $groupConfig.Logical.grouping
             }
             
-            $owners = Get-OwnerNames -Info $group.info
+            $owners = Get-OwnerNames -Info $group.info -ADParams $ADParams
             
             # Generate a deterministic GUID for this group
             $baseName = if ($logicalInfo) { $logicalInfo.BaseName } else { $group.Name }
@@ -139,11 +196,11 @@ function Process-Groups {
             $packages1 += $package
             
             # Process group members
-            $members = Get-ADGroupMember -Identity $group -Recursive
+            $members = Get-ADGroupMember -Identity $group -Recursive @ADParams
             foreach ($member in $members) {
                 if ($member.objectClass -eq "user") {
-                    $user = Get-ADUser -Identity $member.distinguishedName -Properties Department, Title, Manager
-                    $manager = if ($user.Manager) { Get-ADUser -Identity $user.Manager -Properties DisplayName, mail } else { $null }
+                    $user = Get-ADUser -Identity $member.distinguishedName -Properties Department, Title, Manager @ADParams
+                    $manager = if ($user.Manager) { Get-ADUser -Identity $user.Manager -Properties DisplayName, mail @ADParams } else { $null }
                     
                     $memberObj = [PSCustomObject]@{
                         FirstName = $user.GivenName
@@ -169,8 +226,12 @@ function Process-Groups {
 
 # Function to process privilege
 function Process-Privilege {
+    param(
+        [hashtable]$ADParams
+    )
+    
     foreach ($ouPath in $privilegeConfig.ouPaths) {
-        $users = Get-ADUser -Filter * -SearchBase $ouPath -Properties memberOf
+        $users = Get-ADUser -Filter * -SearchBase $ouPath -Properties memberOf @ADParams
         
         foreach ($user in $users) {
             # Generate a deterministic GUID for this user
@@ -189,7 +250,7 @@ function Process-Privilege {
             # Process user's group memberships
             foreach ($groupDN in $user.memberOf) {
                 if ($groupDN -notin $privilegeConfig.exclude) {
-                    $group = Get-ADGroup -Identity $groupDN -Properties Description
+                    $group = Get-ADGroup -Identity $groupDN -Properties Description @ADParams
                     
                     $privilegeGroup = [PSCustomObject]@{
                         GroupName = $group.Name
@@ -207,12 +268,15 @@ function Process-Privilege {
 
 # Main execution
 try {
+    # Establish AD connection
+    $adParams = Connect-AD
+    
     if (-not $PrivilegeOnly) {
-        Process-Groups
+        Process-Groups -ADParams $adParams
     }
     
     if (-not $GroupsOnly) {
-        Process-Privilege
+        Process-Privilege -ADParams $adParams
     }
     
     # Export to CSV
