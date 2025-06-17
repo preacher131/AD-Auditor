@@ -1,0 +1,6 @@
+{
+  "DomainController": "dc01.contoso.com",
+  "OutputFolder": "../output",
+  "LogLevel": "Info",
+  "DefaultCredentialProfile": ""
+}

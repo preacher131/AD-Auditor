@@ -1,0 +1,3 @@
+ReviewID,GroupID,ReviewPackageID,GroupName,PrimaryOwnerEmail,SecondaryOwnerEmail,OUPath,Tag,Description,LogicalGrouping,LogicalAccess
+2025Q2-FIN,{a1b2c3d4-e5f6-7890-abcd-ef1234567890},{f9e8d7c6-b5a4-3210-9876-543210fedcba},Finance-App-ro,finance.manager@contoso.com,finance.lead@contoso.com,"OU=Applications,OU=Groups,DC=contoso,DC=com",Application,Finance application access - Read Only,TRUE,Read Only
+2025Q2-FIN,{b2c3d4e5-f6g7-8901-bcde-f12345678901},{f9e8d7c6-b5a4-3210-9876-543210fedcba},Finance-App-ch,finance.manager@contoso.com,finance.lead@contoso.com,"OU=Applications,OU=Groups,DC=contoso,DC=com",Application,Finance application access - Change,TRUE,Change

@@ -1,0 +1,5 @@
+FirstName,LastName,Email,UserID,Username,Department,JobTitle,ManagerName,ManagerEmail,ReviewPackageID,DerivedGroup,LogicalAccess
+John,Smith,john.smith@contoso.com,{A1B2C3D4-E5F6-7890-ABCD-EF1234567890},jsmith,Finance,Financial Analyst,Sarah Johnson,sarah.johnson@contoso.com,{12345678-ABCD-EF12-3456-789012345678},,Read Only
+Maria,Garcia,maria.garcia@contoso.com,{B2C3D4E5-F6G7-8901-BCDE-F01234567891},mgarcia,Finance,Senior Accountant,Sarah Johnson,sarah.johnson@contoso.com,{23456789-BCDE-F123-4567-890123456789},,Change
+David,Wilson,david.wilson@contoso.com,{C3D4E5F6-G7H8-9012-CDEF-012345678902},dwilson,IT,System Administrator,Michael Brown,michael.brown@contoso.com,{12345678-ABCD-EF12-3456-789012345678},,Read Only
+Jane,Doe,jane.doe@contoso.com,{D4E5F6G7-H8I9-0123-DEFA-1234567890AB},jdoe,Finance,Accountant,Sarah Johnson,sarah.johnson@contoso.com,{12345678-ABCD-EF12-3456-789012345678},Finance-Contractors,Read Only
