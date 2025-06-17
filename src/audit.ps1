@@ -100,8 +100,30 @@ function Get-DeterministicGuid {
     param([string]$InputString)
     $hash = [System.Security.Cryptography.SHA256]::Create()
     $hashBytes = $hash.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($InputString))
-    $guid = [System.Guid]::new($hashBytes)
+    # Take only the first 16 bytes for GUID (SHA256 produces 32 bytes)
+    $guidBytes = $hashBytes[0..15]
+    $guid = [System.Guid]::new($guidBytes)
     return $guid
+}
+
+# Helper: Convert LDAP objectGUID to GUID
+function Convert-LdapGuidToGuid {
+    param($LdapGuid)
+    try {
+        if ($LdapGuid -is [byte[]]) {
+            return New-Object System.Guid -ArgumentList (,$LdapGuid)
+        } elseif ($LdapGuid -is [string]) {
+            return [System.Guid]::Parse($LdapGuid)
+        } else {
+            # Try to convert to byte array first
+            $bytes = [byte[]]$LdapGuid
+            return New-Object System.Guid -ArgumentList (,$bytes)
+        }
+    } catch {
+        Write-Warning "Failed to convert LDAP GUID: $_. Using fallback method."
+        # Fallback: create a deterministic GUID from the string representation
+        return Get-DeterministicGuid $LdapGuid.ToString()
+    }
 }
 
 # Helper: Extract owner names from info and search for email
@@ -178,7 +200,7 @@ function Process-Groups {
                 
                 $owners = Get-OwnerNames -Info $group.info -BaseDN $baseDN
                 $baseName = if ($logicalInfo) { $logicalInfo.BaseName } else { $group.Name }
-                $reviewPackageID = Get-DeterministicGuid "$baseName|$ReviewID|$($group.ObjectGUID)"
+                $reviewPackageID = Get-DeterministicGuid "$baseName|$ReviewID|$($group.ObjectGUID.ToString())"
                 
                 $package = [PSCustomObject]@{
                     ReviewID = $ReviewID
@@ -226,7 +248,7 @@ function Process-Groups {
             $groups = Invoke-LdapSearch -Ldap $global:ldap -BaseDN $baseDN -Filter $groupFilter -Attributes @("cn","description","info","distinguishedName","objectGUID","member")
             foreach ($group in $groups) {
                 $groupName = $group.Attributes["cn"][0]
-                $objectGUID = [guid]::New($group.Attributes["objectGUID"][0])
+                $objectGUID = Convert-LdapGuidToGuid $group.Attributes["objectGUID"][0]
                 $description = if ($group.Attributes["description"]) { $group.Attributes["description"][0] } else { "" }
                 $info = if ($group.Attributes["info"]) { $group.Attributes["info"][0] } else { "" }
                 $dn = $group.Attributes["distinguishedName"][0]
@@ -240,7 +262,7 @@ function Process-Groups {
                 }
                 $owners = Get-OwnerNames -Info $info -BaseDN $baseDN
                 $baseName = if ($logicalInfo) { $logicalInfo.BaseName } else { $groupName }
-                $reviewPackageID = Get-DeterministicGuid "$baseName|$ReviewID|$objectGUID"
+                $reviewPackageID = Get-DeterministicGuid "$baseName|$ReviewID|$($objectGUID.ToString())"
                 $package = [PSCustomObject]@{
                     ReviewID = $ReviewID
                     GroupID = $objectGUID
@@ -260,7 +282,7 @@ function Process-Groups {
                 foreach ($memberDN in $members) {
                     $userEntries = Invoke-LdapSearch -Ldap $global:ldap -BaseDN $memberDN -Filter "(objectClass=user)" -Attributes @("givenName","sn","mail","objectGUID","sAMAccountName","department","title","manager","distinguishedName")
                     foreach ($user in $userEntries) {
-                        $userGUID = [guid]::New($user.Attributes["objectGUID"][0])
+                        $userGUID = Convert-LdapGuidToGuid $user.Attributes["objectGUID"][0]
                         $managerName = ""; $managerEmail = ""
                         if ($user.Attributes["manager"]) {
                             $managerDN = $user.Attributes["manager"][0]
@@ -299,7 +321,7 @@ function Process-Privilege {
             $users = Get-ADUser -Filter * -SearchBase $ouPath -Properties memberOf @global:adParams
             
             foreach ($user in $users) {
-                $reviewPackageID = Get-DeterministicGuid "$($user.SamAccountName)|$ReviewID|$($user.ObjectGUID)"
+                $reviewPackageID = Get-DeterministicGuid "$($user.SamAccountName)|$ReviewID|$($user.ObjectGUID.ToString())"
                 $package = [PSCustomObject]@{
                     ReviewID = $ReviewID
                     GroupID = $user.ObjectGUID
@@ -328,8 +350,8 @@ function Process-Privilege {
             $userFilter = "(objectClass=user)"
             $users = Invoke-LdapSearch -Ldap $global:ldap -BaseDN $ouPath -Filter $userFilter -Attributes @("sAMAccountName","displayName","objectGUID","distinguishedName","memberOf")
             foreach ($user in $users) {
-                $userGUID = [guid]::New($user.Attributes["objectGUID"][0])
-                $reviewPackageID = Get-DeterministicGuid "$($user.Attributes["sAMAccountName"][0])|$ReviewID|$userGUID"
+                $userGUID = Convert-LdapGuidToGuid $user.Attributes["objectGUID"][0]
+                $reviewPackageID = Get-DeterministicGuid "$($user.Attributes["sAMAccountName"][0])|$ReviewID|$($userGUID.ToString())"
                 $package = [PSCustomObject]@{
                     ReviewID = $ReviewID
                     GroupID = $userGUID
@@ -344,7 +366,7 @@ function Process-Privilege {
                     $groupEntry = Invoke-LdapSearch -Ldap $global:ldap -BaseDN $groupDN -Filter "(objectClass=group)" -Attributes @("cn","objectGUID","description") | Select-Object -First 1
                     if ($groupEntry) {
                         $groupName = $groupEntry.Attributes["cn"][0]
-                        $groupGUID = [guid]::New($groupEntry.Attributes["objectGUID"][0])
+                        $groupGUID = Convert-LdapGuidToGuid $groupEntry.Attributes["objectGUID"][0]
                         $description = if ($groupEntry.Attributes["description"]) { $groupEntry.Attributes["description"][0] } else { "" }
                         if ($groupDN -notin $privilegeConfig.exclude) {
                             $privilegeGroup = [PSCustomObject]@{
