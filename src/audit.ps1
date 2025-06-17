@@ -20,14 +20,80 @@ $config = Get-Content (Join-Path $configPath "config.json") | ConvertFrom-Json
 $groupsConfig = Get-Content (Join-Path $configPath "groups.json") | ConvertFrom-Json
 $privilegeConfig = Get-Content (Join-Path $configPath "privilege.json") | ConvertFrom-Json
 
-# Establish LDAP connection
-$ldap = New-LdapConnection `
-    -Server $config.DomainController `
-    -UseLDAPS $config.Connection.UseLDAPS `
-    -UseCurrentUser $config.Connection.UseCurrentUser `
-    -Username $config.Connection.CredentialProfile.Username `
-    -Password $config.Connection.CredentialProfile.Password `
-    -Domain $config.Connection.CredentialProfile.Domain
+# Debug output for config
+Write-Host "Loaded DomainController: '$($config.DomainController)'"
+Write-Host "Loaded Connection.Type: '$($config.Connection.Type)'"
+Write-Host "Loaded UseLDAPS: '$($config.Connection.UseLDAPS)'"
+Write-Host "Loaded UseCurrentUser: '$($config.Connection.UseCurrentUser)'"
+
+# Failsafe for DomainController
+if (-not $config.DomainController -or $config.DomainController -eq "") {
+    throw "DomainController is not set in configs/config.json! (Current value: '$($config.DomainController)')"
+}
+
+# Connection type logic
+$connectionType = if ($config.Connection.Type) { $config.Connection.Type.ToUpper() } else { if ($config.Connection.UseLDAPS) { "LDAPS" } else { "LDAP" } }
+Write-Host "Using connection type: $connectionType"
+
+# Global variables for connection
+$global:ldap = $null
+$global:adParams = $null
+$global:useADModule = $false
+
+switch ($connectionType) {
+    "LDAP" {
+        $global:ldap = New-LdapConnection `
+            -Server $config.DomainController `
+            -UseLDAPS:$false `
+            -UseCurrentUser $config.Connection.UseCurrentUser `
+            -Username $config.Connection.CredentialProfile.Username `
+            -Password $config.Connection.CredentialProfile.Password `
+            -Domain $config.Connection.CredentialProfile.Domain
+        $global:useADModule = $false
+    }
+    "LDAPS" {
+        $global:ldap = New-LdapConnection `
+            -Server $config.DomainController `
+            -UseLDAPS:$true `
+            -UseCurrentUser $config.Connection.UseCurrentUser `
+            -Username $config.Connection.CredentialProfile.Username `
+            -Password $config.Connection.CredentialProfile.Password `
+            -Domain $config.Connection.CredentialProfile.Domain
+        $global:useADModule = $false
+    }
+    "ACTIVEDIRECTORY" {
+        try {
+            Import-Module ActiveDirectory -ErrorAction Stop
+        } catch {
+            throw "ActiveDirectory module is not available. Please install RSAT or use LDAP/LDAPS instead."
+        }
+        
+        # Build AD connection parameters
+        $global:adParams = @{ Server = $config.DomainController }
+        
+        if (-not $config.Connection.UseCurrentUser) {
+            $securePassword = ConvertTo-SecureString $config.Connection.CredentialProfile.Password -AsPlainText -Force
+            $credential = New-Object System.Management.Automation.PSCredential(
+                "$($config.Connection.CredentialProfile.Domain)\$($config.Connection.CredentialProfile.Username)",
+                $securePassword
+            )
+            $global:adParams.Credential = $credential
+        }
+        
+        # Test connection
+        try {
+            $testConnection = Get-ADDomain @global:adParams
+            Write-Host "Successfully connected to AD using ActiveDirectory module"
+        } catch {
+            throw "Failed to connect to AD using ActiveDirectory module: $_"
+        }
+        
+        $global:useADModule = $true
+    }
+    default {
+        throw "Connection type '$connectionType' is not supported. Please use 'LDAP', 'LDAPS', or 'ACTIVEDIRECTORY'."
+    }
+}
 
 # Helper: Generate deterministic GUID
 function Get-DeterministicGuid {
@@ -58,14 +124,27 @@ function Get-OwnerNames {
         if ($Info -match $pattern) {
             $firstName = $matches[1]
             $lastName = $matches[2]
-            $filter = "(&(objectClass=user)(sn=$lastName))"
-            $users = Invoke-LdapSearch -Ldap $ldap -BaseDN $BaseDN -Filter $filter -Attributes @("givenName","sn","mail")
-            $user = $users | Where-Object { $_.Attributes["givenName"][0] -eq $firstName } | Select-Object -First 1
-            if ($user) {
-                if ($pattern -match "Primary|P:") {
-                    $primaryOwner = $user.Attributes["mail"][0]
-                } elseif ($pattern -match "Secondary|S:") {
-                    $secondaryOwner = $user.Attributes["mail"][0]
+            
+            if ($global:useADModule) {
+                $users = Get-ADUser -Filter "Surname -eq '$lastName'" -Properties mail @global:adParams
+                $user = $users | Where-Object { $_.GivenName -eq $firstName } | Select-Object -First 1
+                if ($user) {
+                    if ($pattern -match "Primary|P:") {
+                        $primaryOwner = $user.mail
+                    } elseif ($pattern -match "Secondary|S:") {
+                        $secondaryOwner = $user.mail
+                    }
+                }
+            } else {
+                $filter = "(&(objectClass=user)(sn=$lastName))"
+                $users = Invoke-LdapSearch -Ldap $global:ldap -BaseDN $BaseDN -Filter $filter -Attributes @("givenName","sn","mail")
+                $user = $users | Where-Object { $_.Attributes["givenName"][0] -eq $firstName } | Select-Object -First 1
+                if ($user) {
+                    if ($pattern -match "Primary|P:") {
+                        $primaryOwner = $user.Attributes["mail"][0]
+                    } elseif ($pattern -match "Secondary|S:") {
+                        $secondaryOwner = $user.Attributes["mail"][0]
+                    }
                 }
             }
         }
@@ -83,69 +162,130 @@ $privilegeGroups = @()
 function Process-Groups {
     foreach ($groupConfig in $groupsConfig.groups) {
         $baseDN = $groupConfig.path
-        $groupFilter = "(objectClass=group)"
-        $groups = Invoke-LdapSearch -Ldap $ldap -BaseDN $baseDN -Filter $groupFilter -Attributes @("cn","description","info","distinguishedName","objectGUID","member")
-        foreach ($group in $groups) {
-            $groupName = $group.Attributes["cn"][0]
-            $objectGUID = [guid]::New($group.Attributes["objectGUID"][0])
-            $description = if ($group.Attributes["description"]) { $group.Attributes["description"][0] } else { "" }
-            $info = if ($group.Attributes["info"]) { $group.Attributes["info"][0] } else { "" }
-            $dn = $group.Attributes["distinguishedName"][0]
-            $logicalInfo = $null
-            if ($groupConfig.Logical.isLogical) {
-                foreach ($suffix in $groupConfig.Logical.grouping.PSObject.Properties.Name) {
-                    if ($groupName -like "*$suffix") {
-                        $logicalInfo = @{ BaseName = $groupName -replace "$suffix$"; Access = $groupConfig.Logical.grouping.$suffix }
+        
+        if ($global:useADModule) {
+            $groups = Get-ADGroup -Filter * -SearchBase $baseDN -Properties Description, info, member @global:adParams
+            
+            foreach ($group in $groups) {
+                $logicalInfo = $null
+                if ($groupConfig.Logical.isLogical) {
+                    foreach ($suffix in $groupConfig.Logical.grouping.PSObject.Properties.Name) {
+                        if ($group.Name -like "*$suffix") {
+                            $logicalInfo = @{ BaseName = $group.Name -replace "$suffix$"; Access = $groupConfig.Logical.grouping.$suffix }
+                        }
+                    }
+                }
+                
+                $owners = Get-OwnerNames -Info $group.info -BaseDN $baseDN
+                $baseName = if ($logicalInfo) { $logicalInfo.BaseName } else { $group.Name }
+                $reviewPackageID = Get-DeterministicGuid "$baseName|$ReviewID|$($group.ObjectGUID)"
+                
+                $package = [PSCustomObject]@{
+                    ReviewID = $ReviewID
+                    GroupID = $group.ObjectGUID
+                    ReviewPackageID = $reviewPackageID
+                    GroupName = $baseName
+                    PrimaryOwnerEmail = $owners.PrimaryOwner
+                    SecondaryOwnerEmail = $owners.SecondaryOwner
+                    OUPath = $baseDN
+                    Tag = $groupConfig.category
+                    Description = $group.Description
+                    LogicalGrouping = $groupConfig.Logical.isLogical
+                    LogicalAccess = if ($logicalInfo) { $logicalInfo.Access } else { "" }
+                }
+                $packages1 += $package
+                
+                # Members using AD module
+                $members = Get-ADGroupMember -Identity $group -Recursive @global:adParams
+                foreach ($member in $members) {
+                    if ($member.objectClass -eq "user") {
+                        $user = Get-ADUser -Identity $member.distinguishedName -Properties Department, Title, Manager @global:adParams
+                        $manager = if ($user.Manager) { Get-ADUser -Identity $user.Manager -Properties DisplayName, mail @global:adParams } else { $null }
+                        
+                        $memberObj = [PSCustomObject]@{
+                            FirstName = $user.GivenName
+                            LastName = $user.Surname
+                            Email = $user.mail
+                            UserID = $user.ObjectGUID
+                            Username = "$($user.GivenName) $($user.Surname)"
+                            Department = $user.Department
+                            JobTitle = $user.Title
+                            ManagerName = if ($manager) { "$($manager.GivenName) $($manager.Surname)" } else { "" }
+                            ManagerEmail = if ($manager) { $manager.mail } else { "" }
+                            ReviewPackageID = $reviewPackageID
+                            DerivedGroup = $group.Name
+                            LogicalAccess = if ($logicalInfo) { $logicalInfo.Access } else { "" }
+                        }
+                        $packageMembers1 += $memberObj
                     }
                 }
             }
-            $owners = Get-OwnerNames -Info $info -BaseDN $baseDN
-            $baseName = if ($logicalInfo) { $logicalInfo.BaseName } else { $groupName }
-            $reviewPackageID = Get-DeterministicGuid "$baseName|$ReviewID|$objectGUID"
-            $package = [PSCustomObject]@{
-                ReviewID = $ReviewID
-                GroupID = $objectGUID
-                ReviewPackageID = $reviewPackageID
-                GroupName = $baseName
-                PrimaryOwnerEmail = $owners.PrimaryOwner
-                SecondaryOwnerEmail = $owners.SecondaryOwner
-                OUPath = $baseDN
-                Tag = $groupConfig.category
-                Description = $description
-                LogicalGrouping = $groupConfig.Logical.isLogical
-                LogicalAccess = if ($logicalInfo) { $logicalInfo.Access } else { "" }
-            }
-            $packages1 += $package
-            # Members
-            $members = if ($group.Attributes["member"]) { $group.Attributes["member"] } else { @() }
-            foreach ($memberDN in $members) {
-                $userEntries = Invoke-LdapSearch -Ldap $ldap -BaseDN $memberDN -Filter "(objectClass=user)" -Attributes @("givenName","sn","mail","objectGUID","sAMAccountName","department","title","manager","distinguishedName")
-                foreach ($user in $userEntries) {
-                    $userGUID = [guid]::New($user.Attributes["objectGUID"][0])
-                    $managerName = ""; $managerEmail = ""
-                    if ($user.Attributes["manager"]) {
-                        $managerDN = $user.Attributes["manager"][0]
-                        $managerEntry = Invoke-LdapSearch -Ldap $ldap -BaseDN $managerDN -Filter "(objectClass=user)" -Attributes @("givenName","sn","mail") | Select-Object -First 1
-                        if ($managerEntry) {
-                            $managerName = "$($managerEntry.Attributes["givenName"][0]) $($managerEntry.Attributes["sn"][0])"
-                            $managerEmail = $managerEntry.Attributes["mail"][0]
+        } else {
+            # LDAP logic (existing)
+            $groupFilter = "(objectClass=group)"
+            $groups = Invoke-LdapSearch -Ldap $global:ldap -BaseDN $baseDN -Filter $groupFilter -Attributes @("cn","description","info","distinguishedName","objectGUID","member")
+            foreach ($group in $groups) {
+                $groupName = $group.Attributes["cn"][0]
+                $objectGUID = [guid]::New($group.Attributes["objectGUID"][0])
+                $description = if ($group.Attributes["description"]) { $group.Attributes["description"][0] } else { "" }
+                $info = if ($group.Attributes["info"]) { $group.Attributes["info"][0] } else { "" }
+                $dn = $group.Attributes["distinguishedName"][0]
+                $logicalInfo = $null
+                if ($groupConfig.Logical.isLogical) {
+                    foreach ($suffix in $groupConfig.Logical.grouping.PSObject.Properties.Name) {
+                        if ($groupName -like "*$suffix") {
+                            $logicalInfo = @{ BaseName = $groupName -replace "$suffix$"; Access = $groupConfig.Logical.grouping.$suffix }
                         }
                     }
-                    $memberObj = [PSCustomObject]@{
-                        FirstName = $user.Attributes["givenName"][0]
-                        LastName = $user.Attributes["sn"][0]
-                        Email = $user.Attributes["mail"][0]
-                        UserID = $userGUID
-                        Username = "$($user.Attributes["givenName"][0]) $($user.Attributes["sn"][0])"
-                        Department = $user.Attributes["department"][0]
-                        JobTitle = $user.Attributes["title"][0]
-                        ManagerName = $managerName
-                        ManagerEmail = $managerEmail
-                        ReviewPackageID = $reviewPackageID
-                        DerivedGroup = $groupName
-                        LogicalAccess = if ($logicalInfo) { $logicalInfo.Access } else { "" }
+                }
+                $owners = Get-OwnerNames -Info $info -BaseDN $baseDN
+                $baseName = if ($logicalInfo) { $logicalInfo.BaseName } else { $groupName }
+                $reviewPackageID = Get-DeterministicGuid "$baseName|$ReviewID|$objectGUID"
+                $package = [PSCustomObject]@{
+                    ReviewID = $ReviewID
+                    GroupID = $objectGUID
+                    ReviewPackageID = $reviewPackageID
+                    GroupName = $baseName
+                    PrimaryOwnerEmail = $owners.PrimaryOwner
+                    SecondaryOwnerEmail = $owners.SecondaryOwner
+                    OUPath = $baseDN
+                    Tag = $groupConfig.category
+                    Description = $description
+                    LogicalGrouping = $groupConfig.Logical.isLogical
+                    LogicalAccess = if ($logicalInfo) { $logicalInfo.Access } else { "" }
+                }
+                $packages1 += $package
+                # Members using LDAP
+                $members = if ($group.Attributes["member"]) { $group.Attributes["member"] } else { @() }
+                foreach ($memberDN in $members) {
+                    $userEntries = Invoke-LdapSearch -Ldap $global:ldap -BaseDN $memberDN -Filter "(objectClass=user)" -Attributes @("givenName","sn","mail","objectGUID","sAMAccountName","department","title","manager","distinguishedName")
+                    foreach ($user in $userEntries) {
+                        $userGUID = [guid]::New($user.Attributes["objectGUID"][0])
+                        $managerName = ""; $managerEmail = ""
+                        if ($user.Attributes["manager"]) {
+                            $managerDN = $user.Attributes["manager"][0]
+                            $managerEntry = Invoke-LdapSearch -Ldap $global:ldap -BaseDN $managerDN -Filter "(objectClass=user)" -Attributes @("givenName","sn","mail") | Select-Object -First 1
+                            if ($managerEntry) {
+                                $managerName = "$($managerEntry.Attributes["givenName"][0]) $($managerEntry.Attributes["sn"][0])"
+                                $managerEmail = $managerEntry.Attributes["mail"][0]
+                            }
+                        }
+                        $memberObj = [PSCustomObject]@{
+                            FirstName = $user.Attributes["givenName"][0]
+                            LastName = $user.Attributes["sn"][0]
+                            Email = $user.Attributes["mail"][0]
+                            UserID = $userGUID
+                            Username = "$($user.Attributes["givenName"][0]) $($user.Attributes["sn"][0])"
+                            Department = $user.Attributes["department"][0]
+                            JobTitle = $user.Attributes["title"][0]
+                            ManagerName = $managerName
+                            ManagerEmail = $managerEmail
+                            ReviewPackageID = $reviewPackageID
+                            DerivedGroup = $groupName
+                            LogicalAccess = if ($logicalInfo) { $logicalInfo.Access } else { "" }
+                        }
+                        $packageMembers1 += $memberObj
                     }
-                    $packageMembers1 += $memberObj
                 }
             }
         }
@@ -155,35 +295,66 @@ function Process-Groups {
 # Process Privilege
 function Process-Privilege {
     foreach ($ouPath in $privilegeConfig.ouPaths) {
-        $userFilter = "(objectClass=user)"
-        $users = Invoke-LdapSearch -Ldap $ldap -BaseDN $ouPath -Filter $userFilter -Attributes @("sAMAccountName","displayName","objectGUID","distinguishedName","memberOf")
-        foreach ($user in $users) {
-            $userGUID = [guid]::New($user.Attributes["objectGUID"][0])
-            $reviewPackageID = Get-DeterministicGuid "$($user.Attributes["sAMAccountName"][0])|$ReviewID|$userGUID"
-            $package = [PSCustomObject]@{
-                ReviewID = $ReviewID
-                GroupID = $userGUID
-                GroupName = $user.Attributes["displayName"][0]
-                OUPath = $ouPath
-                ReviewPackageID = $reviewPackageID
-            }
-            $packages2 += $package
-            # Privilege Groups
-            $memberOf = if ($user.Attributes["memberOf"]) { $user.Attributes["memberOf"] } else { @() }
-            foreach ($groupDN in $memberOf) {
-                $groupEntry = Invoke-LdapSearch -Ldap $ldap -BaseDN $groupDN -Filter "(objectClass=group)" -Attributes @("cn","objectGUID","description") | Select-Object -First 1
-                if ($groupEntry) {
-                    $groupName = $groupEntry.Attributes["cn"][0]
-                    $groupGUID = [guid]::New($groupEntry.Attributes["objectGUID"][0])
-                    $description = if ($groupEntry.Attributes["description"]) { $groupEntry.Attributes["description"][0] } else { "" }
+        if ($global:useADModule) {
+            $users = Get-ADUser -Filter * -SearchBase $ouPath -Properties memberOf @global:adParams
+            
+            foreach ($user in $users) {
+                $reviewPackageID = Get-DeterministicGuid "$($user.SamAccountName)|$ReviewID|$($user.ObjectGUID)"
+                $package = [PSCustomObject]@{
+                    ReviewID = $ReviewID
+                    GroupID = $user.ObjectGUID
+                    GroupName = $user.DisplayName
+                    OUPath = $ouPath
+                    ReviewPackageID = $reviewPackageID
+                }
+                $packages2 += $package
+                
+                # Privilege Groups using AD module
+                foreach ($groupDN in $user.memberOf) {
                     if ($groupDN -notin $privilegeConfig.exclude) {
+                        $group = Get-ADGroup -Identity $groupDN -Properties Description @global:adParams
                         $privilegeGroup = [PSCustomObject]@{
-                            GroupName = $groupName
-                            GroupID = $groupGUID
+                            GroupName = $group.Name
+                            GroupID = $group.ObjectGUID
                             ReviewPackageID = $reviewPackageID
-                            Description = $description
+                            Description = $group.Description
                         }
                         $privilegeGroups += $privilegeGroup
+                    }
+                }
+            }
+        } else {
+            # LDAP logic (existing)
+            $userFilter = "(objectClass=user)"
+            $users = Invoke-LdapSearch -Ldap $global:ldap -BaseDN $ouPath -Filter $userFilter -Attributes @("sAMAccountName","displayName","objectGUID","distinguishedName","memberOf")
+            foreach ($user in $users) {
+                $userGUID = [guid]::New($user.Attributes["objectGUID"][0])
+                $reviewPackageID = Get-DeterministicGuid "$($user.Attributes["sAMAccountName"][0])|$ReviewID|$userGUID"
+                $package = [PSCustomObject]@{
+                    ReviewID = $ReviewID
+                    GroupID = $userGUID
+                    GroupName = $user.Attributes["displayName"][0]
+                    OUPath = $ouPath
+                    ReviewPackageID = $reviewPackageID
+                }
+                $packages2 += $package
+                # Privilege Groups using LDAP
+                $memberOf = if ($user.Attributes["memberOf"]) { $user.Attributes["memberOf"] } else { @() }
+                foreach ($groupDN in $memberOf) {
+                    $groupEntry = Invoke-LdapSearch -Ldap $global:ldap -BaseDN $groupDN -Filter "(objectClass=group)" -Attributes @("cn","objectGUID","description") | Select-Object -First 1
+                    if ($groupEntry) {
+                        $groupName = $groupEntry.Attributes["cn"][0]
+                        $groupGUID = [guid]::New($groupEntry.Attributes["objectGUID"][0])
+                        $description = if ($groupEntry.Attributes["description"]) { $groupEntry.Attributes["description"][0] } else { "" }
+                        if ($groupDN -notin $privilegeConfig.exclude) {
+                            $privilegeGroup = [PSCustomObject]@{
+                                GroupName = $groupName
+                                GroupID = $groupGUID
+                                ReviewPackageID = $reviewPackageID
+                                Description = $description
+                            }
+                            $privilegeGroups += $privilegeGroup
+                        }
                     }
                 }
             }

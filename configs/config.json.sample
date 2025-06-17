@@ -3,6 +3,7 @@
   "OutputFolder": "../output",
   "LogLevel": "Info",
   "Connection": {
+    "Type": "LDAPS",
     "UseLDAPS": true,
     "Port": 636,
     "UseCurrentUser": true,
