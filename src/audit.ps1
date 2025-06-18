@@ -268,12 +268,15 @@ foreach ($groupConfig in $groupsConfig.groups) {
             # Get all groups in the OU
             $groups = Get-ADGroup -Filter * -SearchBase $ouPath -Properties Name, Description, Info @adParams
             
+            Write-Host "Found $($groups.Count) groups in OU" -ForegroundColor Cyan
+            
             # Group logical groups together
             $logicalGroups = @{}
             $standaloneGroups = @()
             
             foreach ($group in $groups) {
                 $logicalInfo = Get-LogicalGroupInfo -GroupName $group.Name -LogicalConfig $logicalConfig
+                Write-Host "Group $($group.Name): IsLogical=$($logicalInfo.IsLogical), BaseName=$($logicalInfo.BaseName), Access=$($logicalInfo.LogicalAccess)" -ForegroundColor DarkGray
                 
                 if ($logicalInfo.IsLogical) {
                     if (-not $logicalGroups.ContainsKey($logicalInfo.BaseName)) {
@@ -282,6 +285,7 @@ foreach ($groupConfig in $groupsConfig.groups) {
                             Groups = @()
                             Category = $category
                             OUPath = $ouPath
+                            AccessLevels = @()
                         }
                     }
                     $logicalGroups[$logicalInfo.BaseName].Groups += @{
@@ -289,6 +293,7 @@ foreach ($groupConfig in $groupsConfig.groups) {
                         LogicalAccess = $logicalInfo.LogicalAccess
                         Suffix = $logicalInfo.Suffix
                     }
+                    $logicalGroups[$logicalInfo.BaseName].AccessLevels += $logicalInfo.LogicalAccess
                 } else {
                     $standaloneGroups += $group
                 }
@@ -298,6 +303,8 @@ foreach ($groupConfig in $groupsConfig.groups) {
             foreach ($logicalGroupName in $logicalGroups.Keys) {
                 $logicalGroup = $logicalGroups[$logicalGroupName]
                 
+                Write-Host "Processing logical group: $($logicalGroup.BaseName) with $($logicalGroup.Groups.Count) subgroups" -ForegroundColor Yellow
+                
                 # Use the first group for common properties like description and owners
                 $primaryGroup = $logicalGroup.Groups[0].Group
                 $groupGuid = Get-SimpleObjectGuid $primaryGroup $false
@@ -305,6 +312,9 @@ foreach ($groupConfig in $groupsConfig.groups) {
                 
                 # Extract owner information
                 $ownerInfo = Get-OwnerInformation -InfoText (Get-SafeValue $primaryGroup.Info) -RegexPatterns $groupsConfig.ownerRegexPatterns
+                
+                # Combine all access levels for the logical group
+                $combinedAccessLevels = ($logicalGroup.AccessLevels | Sort-Object -Unique) -join ", "
                 
                 # Create package record
                 $package = New-Object PSObject
@@ -318,7 +328,7 @@ foreach ($groupConfig in $groupsConfig.groups) {
                 $package | Add-Member -MemberType NoteProperty -Name "Tag" -Value $category
                 $package | Add-Member -MemberType NoteProperty -Name "Description" -Value (Get-SafeValue $primaryGroup.Description)
                 $package | Add-Member -MemberType NoteProperty -Name "LogicalGrouping" -Value $true
-                $package | Add-Member -MemberType NoteProperty -Name "LogicalAccess" -Value ""  # Empty for logical parent
+                $package | Add-Member -MemberType NoteProperty -Name "LogicalAccess" -Value $combinedAccessLevels
                 
                 $packages1 += $package
                 
@@ -327,15 +337,20 @@ foreach ($groupConfig in $groupsConfig.groups) {
                     $subGroup = $subGroupInfo.Group
                     $logicalAccess = $subGroupInfo.LogicalAccess
                     
+                    Write-Host "Processing subgroup: $($subGroup.Name) (Access: $logicalAccess)" -ForegroundColor Gray
+                    
                     try {
                         # Get direct members first
                         $directMembers = Get-ADGroupMember -Identity $subGroup @adParams
+                        Write-Host "Found $($directMembers.Count) direct members in subgroup $($subGroup.Name)" -ForegroundColor DarkGray
                         
                         foreach ($directMember in $directMembers) {
                             if ($directMember.objectClass -eq "user") {
                                 # Direct user member
                                 try {
                                     $user = Get-ADUser -Identity $directMember.distinguishedName -Properties mail, givenName, surname, SamAccountName, Department, Title, Manager @adParams
+                                    
+                                    Write-Host "Processing user: $($user.SamAccountName) with access: $logicalAccess" -ForegroundColor DarkGray
                                     
                                     # Get manager information
                                     $managerName = ""
@@ -375,6 +390,8 @@ foreach ($groupConfig in $groupsConfig.groups) {
                                 try {
                                     $nestedGroup = Get-ADGroup -Identity $directMember.distinguishedName @adParams
                                     $nestedMembers = Get-ADGroupMember -Identity $nestedGroup -Recursive @adParams | Where-Object { $_.objectClass -eq "user" }
+                                    
+                                    Write-Host "Processing nested group: $($nestedGroup.Name) with $($nestedMembers.Count) users (Access: $logicalAccess)" -ForegroundColor DarkGray
                                     
                                     foreach ($nestedMember in $nestedMembers) {
                                         try {
@@ -421,13 +438,15 @@ foreach ($groupConfig in $groupsConfig.groups) {
                         }
                     }
                     catch {
-                        Write-Warning "Failed to get group members: $($_.Exception.Message)"
+                        Write-Warning "Failed to get group members for $($subGroup.Name): $($_.Exception.Message)"
                     }
                 }
             }
             
             # Process standalone (non-logical) groups
             foreach ($group in $standaloneGroups) {
+                Write-Host "Processing standalone group: $($group.Name)" -ForegroundColor Gray
+                
                 $groupGuid = Get-SimpleObjectGuid $group $false
                 $reviewPackageID = New-SimpleGuid "$($group.Name)|$ReviewID|$groupGuid"
                 
@@ -450,14 +469,17 @@ foreach ($groupConfig in $groupsConfig.groups) {
                 
                 $packages1 += $package
                 
-                # Process group members (same logic as above but without logical access)
+                # Process group members
                 try {
                     $directMembers = Get-ADGroupMember -Identity $group @adParams
+                    Write-Host "Found $($directMembers.Count) direct members in standalone group $($group.Name)" -ForegroundColor DarkGray
                     
                     foreach ($directMember in $directMembers) {
                         if ($directMember.objectClass -eq "user") {
                             try {
                                 $user = Get-ADUser -Identity $directMember.distinguishedName -Properties mail, givenName, surname, SamAccountName, Department, Title, Manager @adParams
+                                
+                                Write-Host "Processing user: $($user.SamAccountName)" -ForegroundColor DarkGray
                                 
                                 # Get manager information
                                 $managerName = ""
@@ -496,6 +518,8 @@ foreach ($groupConfig in $groupsConfig.groups) {
                             try {
                                 $nestedGroup = Get-ADGroup -Identity $directMember.distinguishedName @adParams
                                 $nestedMembers = Get-ADGroupMember -Identity $nestedGroup -Recursive @adParams | Where-Object { $_.objectClass -eq "user" }
+                                
+                                Write-Host "Processing nested group: $($nestedGroup.Name) with $($nestedMembers.Count) users" -ForegroundColor DarkGray
                                 
                                 foreach ($nestedMember in $nestedMembers) {
                                     try {
@@ -542,7 +566,7 @@ foreach ($groupConfig in $groupsConfig.groups) {
                     }
                 }
                 catch {
-                    Write-Warning "Failed to get group members: $($_.Exception.Message)"
+                    Write-Warning "Failed to get group members for $($group.Name): $($_.Exception.Message)"
                 }
             }
         }
