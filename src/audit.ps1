@@ -260,7 +260,9 @@ if (-not $PrivilegeOnly) {
                             if ($group.Attributes["member"] -and $group.Attributes["member"].Count -gt 0) {
                                 foreach ($memberDN in $group.Attributes["member"]) {
                                     try {
-                                        $userEntry = Invoke-LdapSearch -Ldap $ldapConnection -BaseDN $memberDN -Filter "(objectClass=user)" -Attributes @("givenName","sn","mail") | Select-Object -First 1
+                                        # Convert memberDN to string explicitly
+                                        $memberDNString = $memberDN.ToString()
+                                        $userEntry = Invoke-LdapSearch -Ldap $ldapConnection -BaseDN $memberDNString -Filter "(objectClass=user)" -Attributes @("givenName","sn","mail") | Select-Object -First 1
                                         
                                         if ($userEntry) {
                                             $memberObj = New-Object PSObject
