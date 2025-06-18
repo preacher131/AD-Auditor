@@ -175,6 +175,337 @@ $packageMembers1 = @()     # Reverification Package Members 1
 $packages2 = @()           # Reverification System Packages 1-2 (privilege users)
 $privilegeGroups = @()     # Reverification Privilege Groups 1
 
+# Helper function to check if a user is exempt
+function Test-ExemptUser {
+    param(
+        [object]$User,
+        [array]$ExemptTerms
+    )
+    
+    if (-not $ExemptTerms -or $ExemptTerms.Count -eq 0) {
+        return $false
+    }
+    
+    # Check firstname (givenName)
+    $firstName = Get-SafeValue $User.givenName
+    if (-not [string]::IsNullOrEmpty($firstName)) {
+        foreach ($term in $ExemptTerms) {
+            if ($firstName -like "*$term*") {
+                Write-Host "    User $($User.SamAccountName) marked exempt: firstname '$firstName' contains '$term'" -ForegroundColor Yellow
+                return $true
+            }
+        }
+    }
+    
+    # Check SamAccountName
+    $samAccount = Get-SafeValue $User.SamAccountName
+    if (-not [string]::IsNullOrEmpty($samAccount)) {
+        foreach ($term in $ExemptTerms) {
+            if ($samAccount -like "*$term*") {
+                Write-Host "    User $($User.SamAccountName) marked exempt: SamAccountName contains '$term'" -ForegroundColor Yellow
+                return $true
+            }
+        }
+    }
+    
+    # Check description
+    $description = Get-SafeValue $User.Description
+    if (-not [string]::IsNullOrEmpty($description)) {
+        foreach ($term in $ExemptTerms) {
+            if ($description -like "*$term*") {
+                Write-Host "    User $($User.SamAccountName) marked exempt: description '$description' contains '$term'" -ForegroundColor Yellow
+                return $true
+            }
+        }
+    }
+    
+    return $false
+}
+
+# Helper function to check if a group should be excluded
+function Test-ExcludedGroup {
+    param(
+        [object]$Group,
+        [object]$ProcessingOptions
+    )
+    
+    # Check if group is disabled (if excludeDisabledGroups is enabled)
+    if ($ProcessingOptions.excludeDisabledGroups) {
+        # In AD, groups don't have an "enabled" property like users, but we can check if they're in a disabled state
+        # For now, we'll check if the group has certain system attributes that indicate it's disabled
+        if ($Group.GroupCategory -eq "Security" -and $Group.GroupScope -eq "DomainLocal" -and $Group.Name.StartsWith("$")) {
+            Write-Host "    Excluding disabled/system group: $($Group.Name)" -ForegroundColor Yellow
+            return $true
+        }
+    }
+    
+    # Check if group is a system group (if excludeSystemGroups is enabled)
+    if ($ProcessingOptions.excludeSystemGroups) {
+        $systemGroupPrefixes = @("Domain ", "Enterprise ", "Schema ", "BUILTIN\\", "NT AUTHORITY\\")
+        $systemGroupNames = @("Domain Admins", "Domain Users", "Domain Guests", "Domain Controllers", "Enterprise Admins", "Schema Admins", "Authenticated Users", "Everyone")
+        
+        foreach ($prefix in $systemGroupPrefixes) {
+            if ($Group.Name.StartsWith($prefix)) {
+                Write-Host "    Excluding system group: $($Group.Name) (prefix: $prefix)" -ForegroundColor Yellow
+                return $true
+            }
+        }
+        
+        if ($systemGroupNames -contains $Group.Name) {
+            Write-Host "    Excluding system group: $($Group.Name) (known system group)" -ForegroundColor Yellow
+            return $true
+        }
+        
+        # Exclude groups with certain distinguished name patterns
+        if ($Group.DistinguishedName -match "CN=Builtin|CN=Users,DC=") {
+            Write-Host "    Excluding system group: $($Group.Name) (system container)" -ForegroundColor Yellow
+            return $true
+        }
+    }
+    
+    return $false
+}
+
+# Helper function to get nested group members with depth control
+function Get-NestedGroupMembers {
+    param(
+        [object]$Group,
+        [hashtable]$AdParams,
+        [int]$MaxDepth = 10,
+        [int]$CurrentDepth = 0,
+        [array]$ProcessedGroups = @()
+    )
+    
+    if ($CurrentDepth -ge $MaxDepth) {
+        Write-Host "    Max recursion depth ($MaxDepth) reached for group: $($Group.Name)" -ForegroundColor Yellow
+        return @()
+    }
+    
+    # Prevent infinite loops by tracking processed groups
+    if ($ProcessedGroups -contains $Group.DistinguishedName) {
+        Write-Host "    Circular reference detected, skipping group: $($Group.Name)" -ForegroundColor Yellow
+        return @()
+    }
+    
+    $newProcessedGroups = $ProcessedGroups + $Group.DistinguishedName
+    $allMembers = @()
+    
+    try {
+        $directMembers = Get-ADGroupMember -Identity $Group @AdParams
+        
+        foreach ($member in $directMembers) {
+            if ($member.objectClass -eq "user") {
+                # Add user with membership source info
+                $memberInfo = @{
+                    User = $member
+                    SourceGroup = $Group.Name
+                    MembershipPath = if ($CurrentDepth -eq 0) { $Group.Name } else { "$($Group.Name) (nested)" }
+                    Depth = $CurrentDepth
+                }
+                $allMembers += $memberInfo
+            }
+            elseif ($member.objectClass -eq "group") {
+                # Recursively get members from nested group
+                try {
+                    $nestedGroup = Get-ADGroup -Identity $member.DistinguishedName @AdParams
+                    $nestedMembers = Get-NestedGroupMembers -Group $nestedGroup -AdParams $AdParams -MaxDepth $MaxDepth -CurrentDepth ($CurrentDepth + 1) -ProcessedGroups $newProcessedGroups
+                    
+                    # Update membership path for nested members
+                    foreach ($nestedMember in $nestedMembers) {
+                        $nestedMember.MembershipPath = "$($Group.Name) -> $($nestedMember.MembershipPath)"
+                        $allMembers += $nestedMember
+                    }
+                }
+                catch {
+                    Write-Warning "Failed to process nested group $($member.DistinguishedName): $($_.Exception.Message)"
+                }
+            }
+        }
+    }
+    catch {
+        Write-Warning "Failed to get members for group $($Group.Name): $($_.Exception.Message)"
+    }
+    
+    return $allMembers
+}
+
+# Helper function to search Active Directory for a user by name and return email
+function Get-ADUserEmailByName {
+    param(
+        [string]$FullName,
+        [hashtable]$AdParams,
+        [bool]$UseADModule = $true
+    )
+    
+    if ([string]::IsNullOrWhiteSpace($FullName)) {
+        return ""
+    }
+    
+    # Clean and parse the name
+    $cleanName = $FullName.Trim()
+    $nameParts = $cleanName -split '\s+'
+    
+    if ($nameParts.Count -eq 0) {
+        return ""
+    }
+    
+    try {
+        if ($UseADModule) {
+            Write-Host "    Searching AD for user: $cleanName" -ForegroundColor DarkGray
+            
+            # Build search filters
+            $searchFilters = @()
+            
+            if ($nameParts.Count -eq 1) {
+                # Single name - search in multiple fields
+                $singleName = $nameParts[0]
+                $searchFilters += "DisplayName -like '*$singleName*'"
+                $searchFilters += "givenName -like '*$singleName*'"
+                $searchFilters += "surname -like '*$singleName*'"
+                $searchFilters += "Name -like '*$singleName*'"
+            }
+            elseif ($nameParts.Count -eq 2) {
+                # First and Last name
+                $firstName = $nameParts[0]
+                $lastName = $nameParts[1]
+                
+                # Try exact match first
+                $searchFilters += "(givenName -eq '$firstName' -and surname -eq '$lastName')"
+                $searchFilters += "(givenName -eq '$lastName' -and surname -eq '$firstName')"  # In case they're reversed
+                
+                # Try partial matches
+                $searchFilters += "(givenName -like '*$firstName*' -and surname -like '*$lastName*')"
+                $searchFilters += "(givenName -like '*$lastName*' -and surname -like '*$firstName*')"
+                
+                # Try display name matches
+                $searchFilters += "DisplayName -like '*$firstName*$lastName*'"
+                $searchFilters += "DisplayName -like '*$lastName*$firstName*'"
+            }
+            else {
+                # Multiple names - try as display name
+                $searchFilters += "DisplayName -like '*$cleanName*'"
+                
+                # Try first and last name from the parts
+                $firstName = $nameParts[0]
+                $lastName = $nameParts[-1]  # Last element
+                $searchFilters += "(givenName -like '*$firstName*' -and surname -like '*$lastName*')"
+            }
+            
+            $allResults = @()
+            
+            # Execute searches
+            foreach ($filter in $searchFilters) {
+                try {
+                    Write-Host "      Trying filter: $filter" -ForegroundColor DarkGray
+                    $results = Get-ADUser -Filter $filter -Properties mail, givenName, surname, DisplayName, SamAccountName @AdParams
+                    
+                    if ($results) {
+                        foreach ($result in $results) {
+                            # Avoid duplicates
+                            if ($allResults | Where-Object { $_.SamAccountName -eq $result.SamAccountName }) {
+                                continue
+                            }
+                            $allResults += $result
+                        }
+                    }
+                }
+                catch {
+                    Write-Host "      Filter failed: $($_.Exception.Message)" -ForegroundColor DarkGray
+                    continue
+                }
+                
+                # If we found results with the current filter, check if we can narrow it down
+                if ($allResults.Count -gt 0) {
+                    break
+                }
+            }
+            
+            Write-Host "      Found $($allResults.Count) potential matches" -ForegroundColor DarkGray
+            
+            if ($allResults.Count -eq 0) {
+                Write-Host "      No users found for: $cleanName" -ForegroundColor Yellow
+                return ""
+            }
+            elseif ($allResults.Count -eq 1) {
+                $user = $allResults[0]
+                $email = Get-SafeValue $user.mail
+                Write-Host "      Found single match: $($user.DisplayName) ($($user.SamAccountName)) - Email: $email" -ForegroundColor Green
+                return $email
+            }
+            else {
+                # Multiple results - try to narrow down using first name
+                Write-Host "      Multiple matches found, attempting to narrow down using first name..." -ForegroundColor Yellow
+                
+                if ($nameParts.Count -ge 1) {
+                    $firstName = $nameParts[0]
+                    $filteredResults = $allResults | Where-Object { 
+                        $_.givenName -like "*$firstName*" -or $_.DisplayName -like "*$firstName*"
+                    }
+                    
+                    if ($filteredResults.Count -eq 1) {
+                        $user = $filteredResults[0]
+                        $email = Get-SafeValue $user.mail
+                        Write-Host "      Narrowed down to single match using first name: $($user.DisplayName) ($($user.SamAccountName)) - Email: $email" -ForegroundColor Green
+                        return $email
+                    }
+                    elseif ($filteredResults.Count -gt 1) {
+                        # Still multiple matches - log them and return the first one with an email
+                        Write-Host "      Still multiple matches after first name filter:" -ForegroundColor Yellow
+                        foreach ($result in $filteredResults) {
+                            $email = Get-SafeValue $result.mail
+                            Write-Host "        - $($result.DisplayName) ($($result.SamAccountName)) - Email: $email" -ForegroundColor Yellow
+                        }
+                        
+                        # Return the first user with a non-empty email
+                        $userWithEmail = $filteredResults | Where-Object { -not [string]::IsNullOrWhiteSpace($_.mail) } | Select-Object -First 1
+                        if ($userWithEmail) {
+                            $email = Get-SafeValue $userWithEmail.mail
+                            Write-Host "      Using first match with email: $($userWithEmail.DisplayName) - Email: $email" -ForegroundColor Cyan
+                            return $email
+                        }
+                        else {
+                            Write-Host "      No matches have email addresses" -ForegroundColor Yellow
+                            return ""
+                        }
+                    }
+                    else {
+                        # First name filter eliminated all matches - use original results
+                        Write-Host "      First name filter eliminated all matches, using original results" -ForegroundColor Yellow
+                    }
+                }
+                
+                # Log all matches and return the first one with an email
+                Write-Host "      Multiple matches found:" -ForegroundColor Yellow
+                foreach ($result in $allResults) {
+                    $email = Get-SafeValue $result.mail
+                    Write-Host "        - $($result.DisplayName) ($($result.SamAccountName)) - Email: $email" -ForegroundColor Yellow
+                }
+                
+                # Return the first user with a non-empty email
+                $userWithEmail = $allResults | Where-Object { -not [string]::IsNullOrWhiteSpace($_.mail) } | Select-Object -First 1
+                if ($userWithEmail) {
+                    $email = Get-SafeValue $userWithEmail.mail
+                    Write-Host "      Using first match with email: $($userWithEmail.DisplayName) - Email: $email" -ForegroundColor Cyan
+                    return $email
+                }
+                else {
+                    Write-Host "      No matches have email addresses" -ForegroundColor Yellow
+                    return ""
+                }
+            }
+        }
+        else {
+            # LDAP search would go here
+            Write-Host "      LDAP user search not yet implemented" -ForegroundColor Yellow
+            return ""
+        }
+    }
+    catch {
+        Write-Warning "Failed to search AD for user '$cleanName': $($_.Exception.Message)"
+        return ""
+    }
+}
+
 # Helper function to extract owner information using regex
 function Get-OwnerInformation {
     param(
@@ -185,37 +516,139 @@ function Get-OwnerInformation {
     $result = @{
         PrimaryOwnerEmail = ""
         SecondaryOwnerEmail = ""
+        PrimaryOwnerName = ""
+        SecondaryOwnerName = ""
     }
     
     if ([string]::IsNullOrEmpty($InfoText)) {
         return $result
     }
     
-    # Try different regex patterns for primary owner email
-    $primaryPatterns = @(
+    # Replace line breaks with spaces for some patterns, but keep original for line-based patterns
+    $infoTextSingleLine = $InfoText -replace "`r`n|`r|`n", " "
+    
+    # Comprehensive regex patterns for PRIMARY owners
+    $primaryEmailPatterns = @(
         "Primary Owner:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
         "P:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
-        "Primary:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})"
+        "Primary:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
+        "Owner:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
+        "Owned by:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})"
     )
     
-    foreach ($pattern in $primaryPatterns) {
-        if ($InfoText -match $pattern) {
-            $result.PrimaryOwnerEmail = $Matches[1]
+    $primaryNamePatterns = @(
+        "Primary Owner:\s*([A-Za-z]+(?:\s+[A-Za-z]+)+)",
+        "P:\s*([A-Za-z]+(?:\s+[A-Za-z]+)+)",
+        "Primary:\s*([A-Za-z]+(?:\s+[A-Za-z]+)+)",
+        "Owner:\s*([A-Za-z]+(?:\s+[A-Za-z]+)+)",
+        "Owned by:\s*([A-Za-z]+(?:\s+[A-Za-z]+)+)"
+    )
+    
+    # Comprehensive regex patterns for SECONDARY owners
+    $secondaryEmailPatterns = @(
+        "Secondary Owner:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
+        "S:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
+        "Secondary:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
+        "Backup:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
+        "Alt:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})"
+    )
+    
+    $secondaryNamePatterns = @(
+        "Secondary Owner:\s*([A-Za-z]+(?:\s+[A-Za-z]+)+)",
+        "S:\s*([A-Za-z]+(?:\s+[A-Za-z]+)+)",
+        "Secondary:\s*([A-Za-z]+(?:\s+[A-Za-z]+)+)",
+        "Backup:\s*([A-Za-z]+(?:\s+[A-Za-z]+)+)",
+        "Alt:\s*([A-Za-z]+(?:\s+[A-Za-z]+)+)"
+    )
+    
+    # Special patterns for combined formats like "P: John Doe S: Jane Smith"
+    $combinedPatterns = @(
+        "P:\s*([A-Za-z]+(?:\s+[A-Za-z]+)+).*?S:\s*([A-Za-z]+(?:\s+[A-Za-z]+)+)",
+        "Primary:\s*([A-Za-z]+(?:\s+[A-Za-z]+)+).*?Secondary:\s*([A-Za-z]+(?:\s+[A-Za-z]+)+)",
+        "Owner:\s*([A-Za-z]+(?:\s+[A-Za-z]+)+).*?Backup:\s*([A-Za-z]+(?:\s+[A-Za-z]+)+)"
+    )
+    
+    # Try combined patterns first (for formats like "P: John Doe S: Jane Smith")
+    foreach ($pattern in $combinedPatterns) {
+        if ($infoTextSingleLine -match $pattern) {
+            $result.PrimaryOwnerName = $Matches[1].Trim()
+            $result.SecondaryOwnerName = $Matches[2].Trim()
             break
         }
     }
     
-    # Try different regex patterns for secondary owner email
-    $secondaryPatterns = @(
-        "Secondary Owner:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
-        "S:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
-        "Secondary:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})"
-    )
+    # If no combined pattern matched, try individual patterns
+    if ([string]::IsNullOrEmpty($result.PrimaryOwnerName)) {
+        # Try primary email patterns
+        foreach ($pattern in $primaryEmailPatterns) {
+            if ($InfoText -match $pattern) {
+                $result.PrimaryOwnerEmail = $Matches[1].Trim()
+                break
+            }
+        }
+        
+        # Try primary name patterns
+        foreach ($pattern in $primaryNamePatterns) {
+            if ($InfoText -match $pattern) {
+                $result.PrimaryOwnerName = $Matches[1].Trim()
+                break
+            }
+        }
+    }
     
-    foreach ($pattern in $secondaryPatterns) {
-        if ($InfoText -match $pattern) {
-            $result.SecondaryOwnerEmail = $Matches[1]
-            break
+    if ([string]::IsNullOrEmpty($result.SecondaryOwnerName)) {
+        # Try secondary email patterns
+        foreach ($pattern in $secondaryEmailPatterns) {
+            if ($InfoText -match $pattern) {
+                $result.SecondaryOwnerEmail = $Matches[1].Trim()
+                break
+            }
+        }
+        
+        # Try secondary name patterns
+        foreach ($pattern in $secondaryNamePatterns) {
+            if ($InfoText -match $pattern) {
+                $result.SecondaryOwnerName = $Matches[1].Trim()
+                break
+            }
+        }
+    }
+    
+    # Multi-line processing for cases where owners are on separate lines
+    $lines = $InfoText -split "`r`n|`r|`n"
+    foreach ($line in $lines) {
+        $line = $line.Trim()
+        
+        # Check for primary owner in this line
+        if ([string]::IsNullOrEmpty($result.PrimaryOwnerName) -and [string]::IsNullOrEmpty($result.PrimaryOwnerEmail)) {
+            if ($line -match "^(Primary|P|Owner|Owned by):\s*(.+)") {
+                $ownerInfo = $Matches[2].Trim()
+                if ($ownerInfo -match "@") {
+                    $result.PrimaryOwnerEmail = $ownerInfo
+                } else {
+                    $result.PrimaryOwnerName = $ownerInfo
+                }
+            }
+        }
+        
+        # Check for secondary owner in this line
+        if ([string]::IsNullOrEmpty($result.SecondaryOwnerName) -and [string]::IsNullOrEmpty($result.SecondaryOwnerEmail)) {
+            if ($line -match "^(Secondary|S|Backup|Alt):\s*(.+)") {
+                $ownerInfo = $Matches[2].Trim()
+                if ($ownerInfo -match "@") {
+                    $result.SecondaryOwnerEmail = $ownerInfo
+                } else {
+                    $result.SecondaryOwnerName = $ownerInfo
+                }
+            }
+        }
+    }
+    
+    # If we have names but no emails, try to convert names to emails using common patterns
+    if (-not [string]::IsNullOrEmpty($result.PrimaryOwnerName) -and [string]::IsNullOrEmpty($result.PrimaryOwnerEmail)) {
+        # Look for email in the same info text that might belong to the primary owner
+        if ($InfoText -match "([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})") {
+            $result.PrimaryOwnerEmail = $Matches[1]
         }
     }
     
@@ -253,6 +686,93 @@ function Get-LogicalGroupInfo {
     return $result
 }
 
+# Helper function to extract the best owner information from logical groups
+function Get-LogicalGroupOwnerInformation {
+    param(
+        [object]$LogicalGroup,
+        [array]$RegexPatterns
+    )
+    
+    $bestOwnerInfo = @{
+        PrimaryOwnerEmail = ""
+        SecondaryOwnerEmail = ""
+        PrimaryOwnerName = ""
+        SecondaryOwnerName = ""
+        SourceGroup = ""
+    }
+    
+    Write-Host "Extracting owner information from logical group with $($LogicalGroup.Groups.Count) subgroups" -ForegroundColor DarkGray
+    
+    # Check each subgroup for owner information
+    foreach ($subGroupInfo in $LogicalGroup.Groups) {
+        $subGroup = $subGroupInfo.Group
+        $subGroupOwnerInfo = Get-OwnerInformation -InfoText (Get-SafeValue $subGroup.Info) -RegexPatterns $RegexPatterns
+        
+        Write-Host "  Checking subgroup: $($subGroup.Name)" -ForegroundColor DarkGray
+        
+        # If we find complete owner info (both primary and secondary), use it
+        if ((-not [string]::IsNullOrEmpty($subGroupOwnerInfo.PrimaryOwnerName) -or -not [string]::IsNullOrEmpty($subGroupOwnerInfo.PrimaryOwnerEmail)) -and
+            (-not [string]::IsNullOrEmpty($subGroupOwnerInfo.SecondaryOwnerName) -or -not [string]::IsNullOrEmpty($subGroupOwnerInfo.SecondaryOwnerEmail))) {
+            
+            Write-Host "    Found complete owner info in $($subGroup.Name)" -ForegroundColor Green
+            $bestOwnerInfo.PrimaryOwnerEmail = $subGroupOwnerInfo.PrimaryOwnerEmail
+            $bestOwnerInfo.SecondaryOwnerEmail = $subGroupOwnerInfo.SecondaryOwnerEmail
+            $bestOwnerInfo.PrimaryOwnerName = $subGroupOwnerInfo.PrimaryOwnerName
+            $bestOwnerInfo.SecondaryOwnerName = $subGroupOwnerInfo.SecondaryOwnerName
+            $bestOwnerInfo.SourceGroup = $subGroup.Name
+            break
+        }
+        
+        # If we don't have any owner info yet, use what we find
+        if ([string]::IsNullOrEmpty($bestOwnerInfo.PrimaryOwnerName) -and [string]::IsNullOrEmpty($bestOwnerInfo.PrimaryOwnerEmail) -and
+            [string]::IsNullOrEmpty($bestOwnerInfo.SecondaryOwnerName) -and [string]::IsNullOrEmpty($bestOwnerInfo.SecondaryOwnerEmail)) {
+            
+            if (-not [string]::IsNullOrEmpty($subGroupOwnerInfo.PrimaryOwnerName) -or -not [string]::IsNullOrEmpty($subGroupOwnerInfo.PrimaryOwnerEmail) -or
+                -not [string]::IsNullOrEmpty($subGroupOwnerInfo.SecondaryOwnerName) -or -not [string]::IsNullOrEmpty($subGroupOwnerInfo.SecondaryOwnerEmail)) {
+                
+                Write-Host "    Found partial owner info in $($subGroup.Name)" -ForegroundColor Yellow
+                $bestOwnerInfo.PrimaryOwnerEmail = $subGroupOwnerInfo.PrimaryOwnerEmail
+                $bestOwnerInfo.SecondaryOwnerEmail = $subGroupOwnerInfo.SecondaryOwnerEmail
+                $bestOwnerInfo.PrimaryOwnerName = $subGroupOwnerInfo.PrimaryOwnerName
+                $bestOwnerInfo.SecondaryOwnerName = $subGroupOwnerInfo.SecondaryOwnerName
+                $bestOwnerInfo.SourceGroup = $subGroup.Name
+            }
+        }
+        
+        # Fill in missing primary owner if we have it in this subgroup
+        if ([string]::IsNullOrEmpty($bestOwnerInfo.PrimaryOwnerName) -and [string]::IsNullOrEmpty($bestOwnerInfo.PrimaryOwnerEmail)) {
+            if (-not [string]::IsNullOrEmpty($subGroupOwnerInfo.PrimaryOwnerName) -or -not [string]::IsNullOrEmpty($subGroupOwnerInfo.PrimaryOwnerEmail)) {
+                Write-Host "    Found primary owner in $($subGroup.Name)" -ForegroundColor Cyan
+                $bestOwnerInfo.PrimaryOwnerEmail = $subGroupOwnerInfo.PrimaryOwnerEmail
+                $bestOwnerInfo.PrimaryOwnerName = $subGroupOwnerInfo.PrimaryOwnerName
+                if ([string]::IsNullOrEmpty($bestOwnerInfo.SourceGroup)) {
+                    $bestOwnerInfo.SourceGroup = $subGroup.Name
+                }
+            }
+        }
+        
+        # Fill in missing secondary owner if we have it in this subgroup
+        if ([string]::IsNullOrEmpty($bestOwnerInfo.SecondaryOwnerName) -and [string]::IsNullOrEmpty($bestOwnerInfo.SecondaryOwnerEmail)) {
+            if (-not [string]::IsNullOrEmpty($subGroupOwnerInfo.SecondaryOwnerName) -or -not [string]::IsNullOrEmpty($subGroupOwnerInfo.SecondaryOwnerEmail)) {
+                Write-Host "    Found secondary owner in $($subGroup.Name)" -ForegroundColor Cyan
+                $bestOwnerInfo.SecondaryOwnerEmail = $subGroupOwnerInfo.SecondaryOwnerEmail
+                $bestOwnerInfo.SecondaryOwnerName = $subGroupOwnerInfo.SecondaryOwnerName
+                if ([string]::IsNullOrEmpty($bestOwnerInfo.SourceGroup)) {
+                    $bestOwnerInfo.SourceGroup = $subGroup.Name
+                }
+            }
+        }
+    }
+    
+    if (-not [string]::IsNullOrEmpty($bestOwnerInfo.SourceGroup)) {
+        Write-Host "  Best owner info extracted from: $($bestOwnerInfo.SourceGroup)" -ForegroundColor Green
+    } else {
+        Write-Host "  No owner information found in any subgroup" -ForegroundColor Red
+    }
+    
+    return $bestOwnerInfo
+}
+
 # Process groups
 Write-Host "Processing groups..." -ForegroundColor Cyan
 
@@ -266,9 +786,17 @@ foreach ($groupConfig in $groupsConfig.groups) {
     try {
         if ($useADModule) {
             # Get all groups in the OU
-            $groups = Get-ADGroup -Filter * -SearchBase $ouPath -Properties Name, Description, Info @adParams
+            $allGroups = Get-ADGroup -Filter * -SearchBase $ouPath -Properties Name, Description, Info, GroupCategory, GroupScope, DistinguishedName @adParams
+            Write-Host "Found $($allGroups.Count) total groups in OU" -ForegroundColor Cyan
             
-            Write-Host "Found $($groups.Count) groups in OU" -ForegroundColor Cyan
+            # Filter groups based on processing options
+            $groups = @()
+            foreach ($group in $allGroups) {
+                if (-not (Test-ExcludedGroup -Group $group -ProcessingOptions $groupsConfig.processingOptions)) {
+                    $groups += $group
+                }
+            }
+            Write-Host "After filtering: $($groups.Count) groups will be processed" -ForegroundColor Cyan
             
             # Group logical groups together
             $logicalGroups = @{}
@@ -311,7 +839,41 @@ foreach ($groupConfig in $groupsConfig.groups) {
                 $reviewPackageID = New-SimpleGuid "$($logicalGroup.BaseName)|$ReviewID|$groupGuid"
                 
                 # Extract owner information
-                $ownerInfo = Get-OwnerInformation -InfoText (Get-SafeValue $primaryGroup.Info) -RegexPatterns $groupsConfig.ownerRegexPatterns
+                $ownerInfo = Get-LogicalGroupOwnerInformation -LogicalGroup $logicalGroup -RegexPatterns $groupsConfig.ownerRegexPatterns
+                
+                # Format owner display - lookup emails from AD if we have names
+                $primaryOwnerDisplay = ""
+                $secondaryOwnerDisplay = ""
+                
+                # Handle Primary Owner
+                if (-not [string]::IsNullOrEmpty($ownerInfo.PrimaryOwnerEmail)) {
+                    $primaryOwnerDisplay = $ownerInfo.PrimaryOwnerEmail
+                } elseif (-not [string]::IsNullOrEmpty($ownerInfo.PrimaryOwnerName)) {
+                    Write-Host "  Looking up primary owner: $($ownerInfo.PrimaryOwnerName)" -ForegroundColor Cyan
+                    $primaryOwnerEmail = Get-ADUserEmailByName -FullName $ownerInfo.PrimaryOwnerName -AdParams $adParams -UseADModule $useADModule
+                    if (-not [string]::IsNullOrEmpty($primaryOwnerEmail)) {
+                        $primaryOwnerDisplay = $primaryOwnerEmail
+                        Write-Host "  Primary owner email found: $primaryOwnerEmail" -ForegroundColor Green
+                    } else {
+                        $primaryOwnerDisplay = $ownerInfo.PrimaryOwnerName
+                        Write-Host "  Primary owner email not found, using name: $($ownerInfo.PrimaryOwnerName)" -ForegroundColor Yellow
+                    }
+                }
+                
+                # Handle Secondary Owner
+                if (-not [string]::IsNullOrEmpty($ownerInfo.SecondaryOwnerEmail)) {
+                    $secondaryOwnerDisplay = $ownerInfo.SecondaryOwnerEmail
+                } elseif (-not [string]::IsNullOrEmpty($ownerInfo.SecondaryOwnerName)) {
+                    Write-Host "  Looking up secondary owner: $($ownerInfo.SecondaryOwnerName)" -ForegroundColor Cyan
+                    $secondaryOwnerEmail = Get-ADUserEmailByName -FullName $ownerInfo.SecondaryOwnerName -AdParams $adParams -UseADModule $useADModule
+                    if (-not [string]::IsNullOrEmpty($secondaryOwnerEmail)) {
+                        $secondaryOwnerDisplay = $secondaryOwnerEmail
+                        Write-Host "  Secondary owner email found: $secondaryOwnerEmail" -ForegroundColor Green
+                    } else {
+                        $secondaryOwnerDisplay = $ownerInfo.SecondaryOwnerName
+                        Write-Host "  Secondary owner email not found, using name: $($ownerInfo.SecondaryOwnerName)" -ForegroundColor Yellow
+                    }
+                }
                 
                 # Combine all access levels for the logical group
                 $combinedAccessLevels = ($logicalGroup.AccessLevels | Sort-Object -Unique) -join ", "
@@ -322,8 +884,8 @@ foreach ($groupConfig in $groupsConfig.groups) {
                 $package | Add-Member -MemberType NoteProperty -Name "GroupID" -Value $groupGuid
                 $package | Add-Member -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
                 $package | Add-Member -MemberType NoteProperty -Name "GroupName" -Value $logicalGroup.BaseName
-                $package | Add-Member -MemberType NoteProperty -Name "PrimaryOwnerEmail" -Value $ownerInfo.PrimaryOwnerEmail
-                $package | Add-Member -MemberType NoteProperty -Name "SecondaryOwnerEmail" -Value $ownerInfo.SecondaryOwnerEmail
+                $package | Add-Member -MemberType NoteProperty -Name "PrimaryOwnerEmail" -Value $primaryOwnerDisplay
+                $package | Add-Member -MemberType NoteProperty -Name "SecondaryOwnerEmail" -Value $secondaryOwnerDisplay
                 $package | Add-Member -MemberType NoteProperty -Name "OUPath" -Value $ouPath
                 $package | Add-Member -MemberType NoteProperty -Name "Tag" -Value $category
                 $package | Add-Member -MemberType NoteProperty -Name "Description" -Value (Get-SafeValue $primaryGroup.Description)
@@ -340,146 +902,38 @@ foreach ($groupConfig in $groupsConfig.groups) {
                     Write-Host "Processing subgroup: $($subGroup.Name) (Access: $logicalAccess)" -ForegroundColor Gray
                     
                     try {
-                        # Get direct members first
-                        $directMembers = Get-ADGroupMember -Identity $subGroup @adParams
-                        Write-Host "Found $($directMembers.Count) direct members in subgroup $($subGroup.Name)" -ForegroundColor DarkGray
+                        # Use enhanced member processing with depth control and membership source tracking
+                        $allMembers = @()
                         
-                        foreach ($directMember in $directMembers) {
-                            if ($directMember.objectClass -eq "user") {
-                                # Direct user member
-                                try {
-                                    $user = Get-ADUser -Identity $directMember.distinguishedName -Properties mail, givenName, surname, SamAccountName, Department, Title, Manager @adParams
-                                    
-                                    Write-Host "Processing user: $($user.SamAccountName) with access: $logicalAccess" -ForegroundColor DarkGray
-                                    
-                                    # Get manager information
-                                    $managerName = ""
-                                    $managerEmail = ""
-                                    if ($user.Manager) {
-                                        try {
-                                            $manager = Get-ADUser -Identity $user.Manager -Properties DisplayName, mail @adParams
-                                            $managerName = Get-SafeValue $manager.DisplayName
-                                            $managerEmail = Get-SafeValue $manager.mail
-                                        } catch {
-                                            Write-Warning "Failed to get manager info: $($_.Exception.Message)"
-                                        }
+                        if ($groupsConfig.processingOptions.includeNestedGroups) {
+                            # Get all members including nested with depth control
+                            $allMembers = Get-NestedGroupMembers -Group $subGroup -AdParams $adParams -MaxDepth $groupsConfig.processingOptions.maxRecursionDepth
+                        } else {
+                            # Get only direct members
+                            $directMembers = Get-ADGroupMember -Identity $subGroup @adParams
+                            foreach ($member in $directMembers) {
+                                if ($member.objectClass -eq "user") {
+                                    $memberInfo = @{
+                                        User = $member
+                                        SourceGroup = $subGroup.Name
+                                        MembershipPath = $subGroup.Name
+                                        Depth = 0
                                     }
-                                    
-                                    $memberObj = New-Object PSObject
-                                    $memberObj | Add-Member -MemberType NoteProperty -Name "FirstName" -Value (Get-SafeValue $user.givenName)
-                                    $memberObj | Add-Member -MemberType NoteProperty -Name "LastName" -Value (Get-SafeValue $user.surname)
-                                    $memberObj | Add-Member -MemberType NoteProperty -Name "Username" -Value "$((Get-SafeValue $user.givenName)) $((Get-SafeValue $user.surname))"
-                                    $memberObj | Add-Member -MemberType NoteProperty -Name "Email" -Value (Get-SafeValue $user.mail)
-                                    $memberObj | Add-Member -MemberType NoteProperty -Name "UserID" -Value $user.ObjectGUID.ToString()
-                                    $memberObj | Add-Member -MemberType NoteProperty -Name "Department" -Value (Get-SafeValue $user.Department)
-                                    $memberObj | Add-Member -MemberType NoteProperty -Name "JobTitle" -Value (Get-SafeValue $user.Title)
-                                    $memberObj | Add-Member -MemberType NoteProperty -Name "ManagerName" -Value $managerName
-                                    $memberObj | Add-Member -MemberType NoteProperty -Name "ManagerEmail" -Value $managerEmail
-                                    $memberObj | Add-Member -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
-                                    $memberObj | Add-Member -MemberType NoteProperty -Name "DerivedGroup" -Value ""  # Direct member
-                                    $memberObj | Add-Member -MemberType NoteProperty -Name "LogicalAccess" -Value $logicalAccess
-                                    
-                                    $packageMembers1 += $memberObj
-                                }
-                                catch {
-                                    Write-Warning "Failed to process user: $($_.Exception.Message)"
-                                }
-                            }
-                            elseif ($directMember.objectClass -eq "group") {
-                                # Nested group - get its members
-                                try {
-                                    $nestedGroup = Get-ADGroup -Identity $directMember.distinguishedName @adParams
-                                    $nestedMembers = Get-ADGroupMember -Identity $nestedGroup -Recursive @adParams | Where-Object { $_.objectClass -eq "user" }
-                                    
-                                    Write-Host "Processing nested group: $($nestedGroup.Name) with $($nestedMembers.Count) users (Access: $logicalAccess)" -ForegroundColor DarkGray
-                                    
-                                    foreach ($nestedMember in $nestedMembers) {
-                                        try {
-                                            $user = Get-ADUser -Identity $nestedMember.distinguishedName -Properties mail, givenName, surname, SamAccountName, Department, Title, Manager @adParams
-                                            
-                                            # Get manager information
-                                            $managerName = ""
-                                            $managerEmail = ""
-                                            if ($user.Manager) {
-                                                try {
-                                                    $manager = Get-ADUser -Identity $user.Manager -Properties DisplayName, mail @adParams
-                                                    $managerName = Get-SafeValue $manager.DisplayName
-                                                    $managerEmail = Get-SafeValue $manager.mail
-                                                } catch {
-                                                    Write-Warning "Failed to get manager info: $($_.Exception.Message)"
-                                                }
-                                            }
-                                            
-                                            $memberObj = New-Object PSObject
-                                            $memberObj | Add-Member -MemberType NoteProperty -Name "FirstName" -Value (Get-SafeValue $user.givenName)
-                                            $memberObj | Add-Member -MemberType NoteProperty -Name "LastName" -Value (Get-SafeValue $user.surname)
-                                            $memberObj | Add-Member -MemberType NoteProperty -Name "Username" -Value "$((Get-SafeValue $user.givenName)) $((Get-SafeValue $user.surname))"
-                                            $memberObj | Add-Member -MemberType NoteProperty -Name "Email" -Value (Get-SafeValue $user.mail)
-                                            $memberObj | Add-Member -MemberType NoteProperty -Name "UserID" -Value $user.ObjectGUID.ToString()
-                                            $memberObj | Add-Member -MemberType NoteProperty -Name "Department" -Value (Get-SafeValue $user.Department)
-                                            $memberObj | Add-Member -MemberType NoteProperty -Name "JobTitle" -Value (Get-SafeValue $user.Title)
-                                            $memberObj | Add-Member -MemberType NoteProperty -Name "ManagerName" -Value $managerName
-                                            $memberObj | Add-Member -MemberType NoteProperty -Name "ManagerEmail" -Value $managerEmail
-                                            $memberObj | Add-Member -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
-                                            $memberObj | Add-Member -MemberType NoteProperty -Name "DerivedGroup" -Value $nestedGroup.Name  # Intermediate group
-                                            $memberObj | Add-Member -MemberType NoteProperty -Name "LogicalAccess" -Value $logicalAccess
-                                            
-                                            $packageMembers1 += $memberObj
-                                        }
-                                        catch {
-                                            Write-Warning "Failed to process nested user: $($_.Exception.Message)"
-                                        }
-                                    }
-                                }
-                                catch {
-                                    Write-Warning "Failed to process nested group: $($_.Exception.Message)"
+                                    $allMembers += $memberInfo
                                 }
                             }
                         }
-                    }
-                    catch {
-                        Write-Warning "Failed to get group members for $($subGroup.Name): $($_.Exception.Message)"
-                    }
-                }
-            }
-            
-            # Process standalone (non-logical) groups
-            foreach ($group in $standaloneGroups) {
-                Write-Host "Processing standalone group: $($group.Name)" -ForegroundColor Gray
-                
-                $groupGuid = Get-SimpleObjectGuid $group $false
-                $reviewPackageID = New-SimpleGuid "$($group.Name)|$ReviewID|$groupGuid"
-                
-                # Extract owner information
-                $ownerInfo = Get-OwnerInformation -InfoText (Get-SafeValue $group.Info) -RegexPatterns $groupsConfig.ownerRegexPatterns
-                
-                # Create package record
-                $package = New-Object PSObject
-                $package | Add-Member -MemberType NoteProperty -Name "ReviewID" -Value $ReviewID
-                $package | Add-Member -MemberType NoteProperty -Name "GroupID" -Value $groupGuid
-                $package | Add-Member -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
-                $package | Add-Member -MemberType NoteProperty -Name "GroupName" -Value $group.Name
-                $package | Add-Member -MemberType NoteProperty -Name "PrimaryOwnerEmail" -Value $ownerInfo.PrimaryOwnerEmail
-                $package | Add-Member -MemberType NoteProperty -Name "SecondaryOwnerEmail" -Value $ownerInfo.SecondaryOwnerEmail
-                $package | Add-Member -MemberType NoteProperty -Name "OUPath" -Value $ouPath
-                $package | Add-Member -MemberType NoteProperty -Name "Tag" -Value $category
-                $package | Add-Member -MemberType NoteProperty -Name "Description" -Value (Get-SafeValue $group.Description)
-                $package | Add-Member -MemberType NoteProperty -Name "LogicalGrouping" -Value $false
-                $package | Add-Member -MemberType NoteProperty -Name "LogicalAccess" -Value ""
-                
-                $packages1 += $package
-                
-                # Process group members
-                try {
-                    $directMembers = Get-ADGroupMember -Identity $group @adParams
-                    Write-Host "Found $($directMembers.Count) direct members in standalone group $($group.Name)" -ForegroundColor DarkGray
-                    
-                    foreach ($directMember in $directMembers) {
-                        if ($directMember.objectClass -eq "user") {
+                        
+                        Write-Host "Found $($allMembers.Count) total members in subgroup $($subGroup.Name)" -ForegroundColor DarkGray
+                        
+                        foreach ($memberInfo in $allMembers) {
                             try {
-                                $user = Get-ADUser -Identity $directMember.distinguishedName -Properties mail, givenName, surname, SamAccountName, Department, Title, Manager @adParams
+                                $user = Get-ADUser -Identity $memberInfo.User.distinguishedName -Properties mail, givenName, surname, SamAccountName, Department, Title, Manager, Description @adParams
                                 
-                                Write-Host "Processing user: $($user.SamAccountName)" -ForegroundColor DarkGray
+                                Write-Host "Processing user: $($user.SamAccountName) with access: $logicalAccess" -ForegroundColor DarkGray
+                                
+                                # Check if user is exempt
+                                $isExempt = Test-ExemptUser -User $user -ExemptTerms $groupsConfig.processingOptions.ExemptUsers
                                 
                                 # Get manager information
                                 $managerName = ""
@@ -505,8 +959,17 @@ foreach ($groupConfig in $groupsConfig.groups) {
                                 $memberObj | Add-Member -MemberType NoteProperty -Name "ManagerName" -Value $managerName
                                 $memberObj | Add-Member -MemberType NoteProperty -Name "ManagerEmail" -Value $managerEmail
                                 $memberObj | Add-Member -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
-                                $memberObj | Add-Member -MemberType NoteProperty -Name "DerivedGroup" -Value ""
-                                $memberObj | Add-Member -MemberType NoteProperty -Name "LogicalAccess" -Value ""
+                                
+                                # Add membership source info if enabled
+                                if ($groupsConfig.processingOptions.includeMembershipSource) {
+                                    $memberObj | Add-Member -MemberType NoteProperty -Name "DerivedGroup" -Value $memberInfo.SourceGroup
+                                    $memberObj | Add-Member -MemberType NoteProperty -Name "MembershipPath" -Value $memberInfo.MembershipPath
+                                } else {
+                                    $memberObj | Add-Member -MemberType NoteProperty -Name "DerivedGroup" -Value (if ($memberInfo.Depth -eq 0) { "" } else { $memberInfo.SourceGroup })
+                                }
+                                
+                                $memberObj | Add-Member -MemberType NoteProperty -Name "LogicalAccess" -Value $logicalAccess
+                                $memberObj | Add-Member -MemberType NoteProperty -Name "Exempt" -Value $isExempt
                                 
                                 $packageMembers1 += $memberObj
                             }
@@ -514,54 +977,148 @@ foreach ($groupConfig in $groupsConfig.groups) {
                                 Write-Warning "Failed to process user: $($_.Exception.Message)"
                             }
                         }
-                        elseif ($directMember.objectClass -eq "group") {
-                            try {
-                                $nestedGroup = Get-ADGroup -Identity $directMember.distinguishedName @adParams
-                                $nestedMembers = Get-ADGroupMember -Identity $nestedGroup -Recursive @adParams | Where-Object { $_.objectClass -eq "user" }
-                                
-                                Write-Host "Processing nested group: $($nestedGroup.Name) with $($nestedMembers.Count) users" -ForegroundColor DarkGray
-                                
-                                foreach ($nestedMember in $nestedMembers) {
-                                    try {
-                                        $user = Get-ADUser -Identity $nestedMember.distinguishedName -Properties mail, givenName, surname, SamAccountName, Department, Title, Manager @adParams
-                                        
-                                        # Get manager information
-                                        $managerName = ""
-                                        $managerEmail = ""
-                                        if ($user.Manager) {
-                                            try {
-                                                $manager = Get-ADUser -Identity $user.Manager -Properties DisplayName, mail @adParams
-                                                $managerName = Get-SafeValue $manager.DisplayName
-                                                $managerEmail = Get-SafeValue $manager.mail
-                                            } catch {
-                                                Write-Warning "Failed to get manager info: $($_.Exception.Message)"
-                                            }
-                                        }
-                                        
-                                        $memberObj = New-Object PSObject
-                                        $memberObj | Add-Member -MemberType NoteProperty -Name "FirstName" -Value (Get-SafeValue $user.givenName)
-                                        $memberObj | Add-Member -MemberType NoteProperty -Name "LastName" -Value (Get-SafeValue $user.surname)
-                                        $memberObj | Add-Member -MemberType NoteProperty -Name "Username" -Value "$((Get-SafeValue $user.givenName)) $((Get-SafeValue $user.surname))"
-                                        $memberObj | Add-Member -MemberType NoteProperty -Name "Email" -Value (Get-SafeValue $user.mail)
-                                        $memberObj | Add-Member -MemberType NoteProperty -Name "UserID" -Value $user.ObjectGUID.ToString()
-                                        $memberObj | Add-Member -MemberType NoteProperty -Name "Department" -Value (Get-SafeValue $user.Department)
-                                        $memberObj | Add-Member -MemberType NoteProperty -Name "JobTitle" -Value (Get-SafeValue $user.Title)
-                                        $memberObj | Add-Member -MemberType NoteProperty -Name "ManagerName" -Value $managerName
-                                        $memberObj | Add-Member -MemberType NoteProperty -Name "ManagerEmail" -Value $managerEmail
-                                        $memberObj | Add-Member -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
-                                        $memberObj | Add-Member -MemberType NoteProperty -Name "DerivedGroup" -Value $nestedGroup.Name
-                                        $memberObj | Add-Member -MemberType NoteProperty -Name "LogicalAccess" -Value ""
-                                        
-                                        $packageMembers1 += $memberObj
-                                    }
-                                    catch {
-                                        Write-Warning "Failed to process nested user: $($_.Exception.Message)"
-                                    }
+                    }
+                    catch {
+                        Write-Warning "Failed to get group members for $($subGroup.Name): $($_.Exception.Message)"
+                    }
+                }
+            }
+            
+            # Process standalone (non-logical) groups
+            foreach ($group in $standaloneGroups) {
+                Write-Host "Processing standalone group: $($group.Name)" -ForegroundColor Gray
+                
+                $groupGuid = Get-SimpleObjectGuid $group $false
+                $reviewPackageID = New-SimpleGuid "$($group.Name)|$ReviewID|$groupGuid"
+                
+                # Extract owner information
+                $ownerInfo = Get-OwnerInformation -InfoText (Get-SafeValue $group.Info) -RegexPatterns $groupsConfig.ownerRegexPatterns
+                
+                # Format owner display - lookup emails from AD if we have names
+                $primaryOwnerDisplay = ""
+                $secondaryOwnerDisplay = ""
+                
+                # Handle Primary Owner
+                if (-not [string]::IsNullOrEmpty($ownerInfo.PrimaryOwnerEmail)) {
+                    $primaryOwnerDisplay = $ownerInfo.PrimaryOwnerEmail
+                } elseif (-not [string]::IsNullOrEmpty($ownerInfo.PrimaryOwnerName)) {
+                    Write-Host "  Looking up primary owner: $($ownerInfo.PrimaryOwnerName)" -ForegroundColor Cyan
+                    $primaryOwnerEmail = Get-ADUserEmailByName -FullName $ownerInfo.PrimaryOwnerName -AdParams $adParams -UseADModule $useADModule
+                    if (-not [string]::IsNullOrEmpty($primaryOwnerEmail)) {
+                        $primaryOwnerDisplay = $primaryOwnerEmail
+                        Write-Host "  Primary owner email found: $primaryOwnerEmail" -ForegroundColor Green
+                    } else {
+                        $primaryOwnerDisplay = $ownerInfo.PrimaryOwnerName
+                        Write-Host "  Primary owner email not found, using name: $($ownerInfo.PrimaryOwnerName)" -ForegroundColor Yellow
+                    }
+                }
+                
+                # Handle Secondary Owner
+                if (-not [string]::IsNullOrEmpty($ownerInfo.SecondaryOwnerEmail)) {
+                    $secondaryOwnerDisplay = $ownerInfo.SecondaryOwnerEmail
+                } elseif (-not [string]::IsNullOrEmpty($ownerInfo.SecondaryOwnerName)) {
+                    Write-Host "  Looking up secondary owner: $($ownerInfo.SecondaryOwnerName)" -ForegroundColor Cyan
+                    $secondaryOwnerEmail = Get-ADUserEmailByName -FullName $ownerInfo.SecondaryOwnerName -AdParams $adParams -UseADModule $useADModule
+                    if (-not [string]::IsNullOrEmpty($secondaryOwnerEmail)) {
+                        $secondaryOwnerDisplay = $secondaryOwnerEmail
+                        Write-Host "  Secondary owner email found: $secondaryOwnerEmail" -ForegroundColor Green
+                    } else {
+                        $secondaryOwnerDisplay = $ownerInfo.SecondaryOwnerName
+                        Write-Host "  Secondary owner email not found, using name: $($ownerInfo.SecondaryOwnerName)" -ForegroundColor Yellow
+                    }
+                }
+                
+                # Create package record
+                $package = New-Object PSObject
+                $package | Add-Member -MemberType NoteProperty -Name "ReviewID" -Value $ReviewID
+                $package | Add-Member -MemberType NoteProperty -Name "GroupID" -Value $groupGuid
+                $package | Add-Member -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
+                $package | Add-Member -MemberType NoteProperty -Name "GroupName" -Value $group.Name
+                $package | Add-Member -MemberType NoteProperty -Name "PrimaryOwnerEmail" -Value $primaryOwnerDisplay
+                $package | Add-Member -MemberType NoteProperty -Name "SecondaryOwnerEmail" -Value $secondaryOwnerDisplay
+                $package | Add-Member -MemberType NoteProperty -Name "OUPath" -Value $ouPath
+                $package | Add-Member -MemberType NoteProperty -Name "Tag" -Value $category
+                $package | Add-Member -MemberType NoteProperty -Name "Description" -Value (Get-SafeValue $group.Description)
+                $package | Add-Member -MemberType NoteProperty -Name "LogicalGrouping" -Value $false
+                $package | Add-Member -MemberType NoteProperty -Name "LogicalAccess" -Value ""
+                
+                $packages1 += $package
+                
+                # Process group members
+                try {
+                    # Use enhanced member processing with depth control and membership source tracking
+                    $allMembers = @()
+                    
+                    if ($groupsConfig.processingOptions.includeNestedGroups) {
+                        # Get all members including nested with depth control
+                        $allMembers = Get-NestedGroupMembers -Group $group -AdParams $adParams -MaxDepth $groupsConfig.processingOptions.maxRecursionDepth
+                    } else {
+                        # Get only direct members
+                        $directMembers = Get-ADGroupMember -Identity $group @adParams
+                        foreach ($member in $directMembers) {
+                            if ($member.objectClass -eq "user") {
+                                $memberInfo = @{
+                                    User = $member
+                                    SourceGroup = $group.Name
+                                    MembershipPath = $group.Name
+                                    Depth = 0
+                                }
+                                $allMembers += $memberInfo
+                            }
+                        }
+                    }
+                    
+                    Write-Host "Found $($allMembers.Count) total members in standalone group $($group.Name)" -ForegroundColor DarkGray
+                    
+                    foreach ($memberInfo in $allMembers) {
+                        try {
+                            $user = Get-ADUser -Identity $memberInfo.User.distinguishedName -Properties mail, givenName, surname, SamAccountName, Department, Title, Manager, Description @adParams
+                            
+                            Write-Host "Processing user: $($user.SamAccountName)" -ForegroundColor DarkGray
+                            
+                            # Check if user is exempt
+                            $isExempt = Test-ExemptUser -User $user -ExemptTerms $groupsConfig.processingOptions.ExemptUsers
+                            
+                            # Get manager information
+                            $managerName = ""
+                            $managerEmail = ""
+                            if ($user.Manager) {
+                                try {
+                                    $manager = Get-ADUser -Identity $user.Manager -Properties DisplayName, mail @adParams
+                                    $managerName = Get-SafeValue $manager.DisplayName
+                                    $managerEmail = Get-SafeValue $manager.mail
+                                } catch {
+                                    Write-Warning "Failed to get manager info: $($_.Exception.Message)"
                                 }
                             }
-                            catch {
-                                Write-Warning "Failed to process nested group: $($_.Exception.Message)"
+                            
+                            $memberObj = New-Object PSObject
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "FirstName" -Value (Get-SafeValue $user.givenName)
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "LastName" -Value (Get-SafeValue $user.surname)
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "Username" -Value "$((Get-SafeValue $user.givenName)) $((Get-SafeValue $user.surname))"
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "Email" -Value (Get-SafeValue $user.mail)
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "UserID" -Value $user.ObjectGUID.ToString()
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "Department" -Value (Get-SafeValue $user.Department)
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "JobTitle" -Value (Get-SafeValue $user.Title)
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "ManagerName" -Value $managerName
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "ManagerEmail" -Value $managerEmail
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
+                            
+                            # Add membership source info if enabled
+                            if ($groupsConfig.processingOptions.includeMembershipSource) {
+                                $memberObj | Add-Member -MemberType NoteProperty -Name "DerivedGroup" -Value $memberInfo.SourceGroup
+                                $memberObj | Add-Member -MemberType NoteProperty -Name "MembershipPath" -Value $memberInfo.MembershipPath
+                            } else {
+                                $memberObj | Add-Member -MemberType NoteProperty -Name "DerivedGroup" -Value (if ($memberInfo.Depth -eq 0) { "" } else { $memberInfo.SourceGroup })
                             }
+                            
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "LogicalAccess" -Value ""
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "Exempt" -Value $isExempt
+                            
+                            $packageMembers1 += $memberObj
+                        }
+                        catch {
+                            Write-Warning "Failed to process user: $($_.Exception.Message)"
                         }
                     }
                 }
