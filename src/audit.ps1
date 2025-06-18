@@ -209,11 +209,12 @@ if (-not $PrivilegeOnly) {
                             if ($directMember.objectClass -eq "user") {
                                 # Direct user member - DerivedGroup should be empty or the main group
                                 try {
-                                    $user = Get-ADUser -Identity $directMember.distinguishedName -Properties mail, givenName, surname @adParams
+                                    $user = Get-ADUser -Identity $directMember.distinguishedName -Properties mail, givenName, surname, SamAccountName @adParams
                                     
                                     $memberObj = New-Object PSObject
                                     $memberObj | Add-Member -MemberType NoteProperty -Name "FirstName" -Value (Get-SafeValue $user.givenName)
                                     $memberObj | Add-Member -MemberType NoteProperty -Name "LastName" -Value (Get-SafeValue $user.surname)
+                                    $memberObj | Add-Member -MemberType NoteProperty -Name "Username" -Value (Get-SafeValue $user.SamAccountName)
                                     $memberObj | Add-Member -MemberType NoteProperty -Name "Email" -Value (Get-SafeValue $user.mail)
                                     $memberObj | Add-Member -MemberType NoteProperty -Name "UserID" -Value $user.ObjectGUID.ToString()
                                     $memberObj | Add-Member -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
@@ -233,11 +234,12 @@ if (-not $PrivilegeOnly) {
                                     
                                     foreach ($nestedMember in $nestedMembers) {
                                         try {
-                                            $user = Get-ADUser -Identity $nestedMember.distinguishedName -Properties mail, givenName, surname @adParams
+                                            $user = Get-ADUser -Identity $nestedMember.distinguishedName -Properties mail, givenName, surname, SamAccountName @adParams
                                             
                                             $memberObj = New-Object PSObject
                                             $memberObj | Add-Member -MemberType NoteProperty -Name "FirstName" -Value (Get-SafeValue $user.givenName)
                                             $memberObj | Add-Member -MemberType NoteProperty -Name "LastName" -Value (Get-SafeValue $user.surname)
+                                            $memberObj | Add-Member -MemberType NoteProperty -Name "Username" -Value (Get-SafeValue $user.SamAccountName)
                                             $memberObj | Add-Member -MemberType NoteProperty -Name "Email" -Value (Get-SafeValue $user.mail)
                                             $memberObj | Add-Member -MemberType NoteProperty -Name "UserID" -Value $user.ObjectGUID.ToString()
                                             $memberObj | Add-Member -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
@@ -302,7 +304,7 @@ if (-not $PrivilegeOnly) {
                                         }
                                         
                                         # Check if member is a user
-                                        $userEntry = Invoke-LdapSearch -Ldap $ldapConnection -BaseDN $memberDNString -Filter "(objectClass=user)" -Attributes @("givenName","sn","mail") | Select-Object -First 1
+                                        $userEntry = Invoke-LdapSearch -Ldap $ldapConnection -BaseDN $memberDNString -Filter "(objectClass=user)" -Attributes @("givenName","sn","mail","sAMAccountName") | Select-Object -First 1
                                         
                                         if ($userEntry) {
                                             # Direct user member
@@ -323,8 +325,14 @@ if (-not $PrivilegeOnly) {
                                                 $email = $userEntry.Attributes["mail"][0]
                                             }
                                             
+                                            $username = ""
+                                            if ($userEntry.Attributes["sAMAccountName"] -and $userEntry.Attributes["sAMAccountName"].Count -gt 0) {
+                                                $username = $userEntry.Attributes["sAMAccountName"][0]
+                                            }
+                                            
                                             $memberObj | Add-Member -MemberType NoteProperty -Name "FirstName" -Value $firstName
                                             $memberObj | Add-Member -MemberType NoteProperty -Name "LastName" -Value $lastName
+                                            $memberObj | Add-Member -MemberType NoteProperty -Name "Username" -Value $username
                                             $memberObj | Add-Member -MemberType NoteProperty -Name "Email" -Value $email
                                             $memberObj | Add-Member -MemberType NoteProperty -Name "UserID" -Value (Get-SimpleObjectGuid $userEntry $true)
                                             $memberObj | Add-Member -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
@@ -351,7 +359,7 @@ if (-not $PrivilegeOnly) {
                                                                 $nestedMemberDNString = $nestedMemberDN.ToString()
                                                             }
                                                             
-                                                            $nestedUserEntry = Invoke-LdapSearch -Ldap $ldapConnection -BaseDN $nestedMemberDNString -Filter "(objectClass=user)" -Attributes @("givenName","sn","mail") | Select-Object -First 1
+                                                            $nestedUserEntry = Invoke-LdapSearch -Ldap $ldapConnection -BaseDN $nestedMemberDNString -Filter "(objectClass=user)" -Attributes @("givenName","sn","mail","sAMAccountName") | Select-Object -First 1
                                                             
                                                             if ($nestedUserEntry) {
                                                                 $memberObj = New-Object PSObject
@@ -371,8 +379,14 @@ if (-not $PrivilegeOnly) {
                                                                     $email = $nestedUserEntry.Attributes["mail"][0]
                                                                 }
                                                                 
+                                                                $username = ""
+                                                                if ($nestedUserEntry.Attributes["sAMAccountName"] -and $nestedUserEntry.Attributes["sAMAccountName"].Count -gt 0) {
+                                                                    $username = $nestedUserEntry.Attributes["sAMAccountName"][0]
+                                                                }
+                                                                
                                                                 $memberObj | Add-Member -MemberType NoteProperty -Name "FirstName" -Value $firstName
                                                                 $memberObj | Add-Member -MemberType NoteProperty -Name "LastName" -Value $lastName
+                                                                $memberObj | Add-Member -MemberType NoteProperty -Name "Username" -Value $username
                                                                 $memberObj | Add-Member -MemberType NoteProperty -Name "Email" -Value $email
                                                                 $memberObj | Add-Member -MemberType NoteProperty -Name "UserID" -Value (Get-SimpleObjectGuid $nestedUserEntry $true)
                                                                 $memberObj | Add-Member -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
