@@ -1,14 +1,14 @@
 {
   "ouPaths": [
-    "OU=Users,OU=Corporate,DC=domain,DC=com",
-    "OU=Service Accounts,OU=IT,DC=domain,DC=com",
-    "OU=Contractors,OU=External,DC=domain,DC=com"
+    "OU=Users,OU=Corporate,DC=yourdomain,DC=com",
+    "OU=Service Accounts,OU=IT,DC=yourdomain,DC=com",
+    "OU=Contractors,OU=External,DC=yourdomain,DC=com"
   ],
   "exclude": [
-    "CN=Domain Users,CN=Users,DC=domain,DC=com",
-    "CN=Authenticated Users,CN=Builtin,DC=domain,DC=com",
-    "CN=Everyone,CN=Builtin,DC=domain,DC=com",
-    "CN=Users,CN=Builtin,DC=domain,DC=com"
+    "CN=Domain Users,CN=Users,DC=yourdomain,DC=com",
+    "CN=Authenticated Users,CN=Builtin,DC=yourdomain,DC=com",
+    "CN=Everyone,CN=Builtin,DC=yourdomain,DC=com",
+    "CN=Users,CN=Builtin,DC=yourdomain,DC=com"
   ],
   "userAttributes": [
     "sAMAccountName",
@@ -30,7 +30,9 @@
     "excludeSystemGroups": true,
     "includeNestedGroupMembership": true,
     "filterByLastLogon": false,
-    "lastLogonDays": 90
+    "lastLogonDays": 90,
+    "maxUsersPerOU": 50,
+    "queryTimeoutSeconds": 60
   },
   "outputSettings": {
     "packages2FileName": "Packages2_{ReviewId}.csv",
@@ -41,8 +43,8 @@
     "groupDescriptionTruncate": 255
   },
   "_comments": {
-    "ouPaths": "Array of LDAP DNs for OUs containing users to audit",
-    "exclude": "Array of group DNs to exclude from privilege analysis",
+    "ouPaths": "Array of LDAP DNs for OUs containing users to audit - UPDATE THESE PATHS!",
+    "exclude": "Array of group DNs to exclude from privilege analysis - UPDATE THESE PATHS!",
     "userAttributes": "AD attributes to retrieve for each user",
     "processingOptions.includeDisabledUsers": "false to skip disabled user accounts",
     "processingOptions.filterByLastLogon": "true to filter users by last logon date"
