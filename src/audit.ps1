@@ -1161,16 +1161,69 @@ if (-not $GroupsOnly) {
         Write-Host "Processing OU: $ouPath" -ForegroundColor Yellow
         
         try {
+            # First test if the OU exists and is accessible
+            Write-Host "  Testing OU accessibility..." -ForegroundColor DarkGray
+            try {
+                $testOU = Get-ADOrganizationalUnit -Identity $ouPath @adParams
+                Write-Host "  OU accessible: $($testOU.Name)" -ForegroundColor Green
+            }
+            catch {
+                Write-Warning "  Cannot access OU: $($_.Exception.Message)"
+                continue
+            }
+            
             if ($useADModule) {
                 # Get all users in the OU with required attributes
-                $users = Get-ADUser -Filter * -SearchBase $ouPath -Properties sAMAccountName, displayName, mail, department, title, manager, enabled, lastLogonDate, memberOf, distinguishedName, userPrincipalName, employeeID @adParams
+                Write-Host "  Querying users from OU..." -ForegroundColor DarkGray
+                
+                # Add timeout for the AD query
+                $adJob = Start-Job -ScriptBlock {
+                    param($ouPath, $adParams)
+                    Import-Module ActiveDirectory
+                    Get-ADUser -Filter * -SearchBase $ouPath -Properties sAMAccountName, displayName, mail, department, title, manager, enabled, lastLogonDate, memberOf, distinguishedName, userPrincipalName, employeeID @adParams
+                } -ArgumentList $ouPath, $adParams
+                
+                # Wait for job with timeout (configurable)
+                $timeout = $privilegeConfig.processingOptions.queryTimeoutSeconds
+                $completed = Wait-Job -Job $adJob -Timeout $timeout
+                
+                if ($completed) {
+                    $users = Receive-Job -Job $adJob
+                    Remove-Job -Job $adJob
+                } else {
+                    Write-Warning "  AD query timed out after $timeout seconds. Stopping job..."
+                    Stop-Job -Job $adJob
+                    Remove-Job -Job $adJob
+                    Write-Warning "AD query for OU '$ouPath' timed out. This OU may be too large or there may be connectivity issues."
+                    Write-Host "  SUGGESTION: Try increasing 'queryTimeoutSeconds' in privilege.json or reduce 'maxUsersPerOU'" -ForegroundColor Yellow
+                    Write-Host "  SUGGESTION: Consider breaking large OUs into smaller sub-OUs for better performance" -ForegroundColor Yellow
+                    continue
+                }
+                
+                Write-Host "  Found $($users.Count) users to process" -ForegroundColor Green
+                
+                # Apply user limit if configured
+                $maxUsers = $privilegeConfig.processingOptions.maxUsersPerOU
+                if ($maxUsers -gt 0 -and $users.Count -gt $maxUsers) {
+                    Write-Warning "  User count ($($users.Count)) exceeds limit ($maxUsers). Processing first $maxUsers users only."
+                    $users = $users | Select-Object -First $maxUsers
+                }
+                
+                $userCount = 0
                 
                 foreach ($user in $users) {
+                    $userCount++
+                    
+                    # Progress reporting for all users when there are only 50
+                    Write-Host "    Processing user $userCount/$($users.Count): $($user.SamAccountName)" -ForegroundColor DarkGray
+                    
                     # Skip disabled users if configured
                     if (-not $privilegeConfig.processingOptions.includeDisabledUsers -and -not $user.enabled) {
+                        Write-Host "      Skipping disabled user: $($user.SamAccountName)" -ForegroundColor Yellow
                         continue
                     }
                     
+                    Write-Host "      Creating user package..." -ForegroundColor DarkGray
                     $userGuid = Get-SimpleObjectGuid $user $false
                     $reviewPackageID = New-SimpleGuid "$($user.SamAccountName)|$ReviewID|$userGuid"
                     
@@ -1185,7 +1238,12 @@ if (-not $GroupsOnly) {
                     
                     # Process user's group memberships
                     if ($user.memberOf) {
+                        Write-Host "      Processing $($user.memberOf.Count) group memberships..." -ForegroundColor DarkGray
+                        $groupCount = 0
+                        
                         foreach ($groupDN in $user.memberOf) {
+                            $groupCount++
+                            Write-Host "        Group $groupCount/$($user.memberOf.Count): $groupDN" -ForegroundColor DarkGray
                             # Check if group should be excluded
                             $shouldExclude = $false
                             foreach ($excludePattern in $privilegeConfig.exclude) {
@@ -1197,7 +1255,10 @@ if (-not $GroupsOnly) {
                             
                             if (-not $shouldExclude) {
                                 try {
+                                    Write-Host "          Getting group details..." -ForegroundColor DarkGray
                                     $group = Get-ADGroup -Identity $groupDN -Properties Description @adParams
+                                    Write-Host "          Group found: $($group.Name)" -ForegroundColor DarkGray
+                                    
                                     $groupGuid = Get-SimpleObjectGuid $group $false
                                     
                                     # Create privilege group record (Reverification Privilege Groups 1)
@@ -1208,10 +1269,13 @@ if (-not $GroupsOnly) {
                                     $privilegeGroup | Add-Member -MemberType NoteProperty -Name "Description" -Value (Get-SafeValue $group.Description)
                                     
                                     $privilegeGroups += $privilegeGroup
+                                    Write-Host "          Added privilege group record" -ForegroundColor DarkGray
                                 }
                                 catch {
-                                    Write-Warning "Failed to get group info for $groupDN : $($_.Exception.Message)"
+                                    Write-Warning "          Failed to get group info for $groupDN : $($_.Exception.Message)"
                                 }
+                            } else {
+                                Write-Host "          Group excluded by filter" -ForegroundColor Yellow
                             }
                         }
                     }
