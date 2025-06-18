@@ -628,4 +628,4 @@ try {
         try { $global:ldapConnection.Dispose() } catch { }
     }
 }
-#endregion 
+#endregion
