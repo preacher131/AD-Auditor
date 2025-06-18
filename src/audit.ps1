@@ -266,7 +266,7 @@ foreach ($groupConfig in $groupsConfig.groups) {
     try {
         if ($useADModule) {
             # Get all groups in the OU
-            $groups = Get-ADGroup -Filter * -SearchBase $ouPath -Properties Name, Description, Info, Members @adParams
+            $groups = Get-ADGroup -Filter * -SearchBase $ouPath -Properties Name, Description, Info @adParams
             
             # Group logical groups together
             $logicalGroups = @{}
@@ -568,7 +568,7 @@ if (-not $GroupsOnly) {
         try {
             if ($useADModule) {
                 # Get all users in the OU with required attributes
-                $users = Get-ADUser -Filter * -SearchBase $ouPath -Properties $privilegeConfig.userAttributes @adParams
+                $users = Get-ADUser -Filter * -SearchBase $ouPath -Properties sAMAccountName, displayName, mail, department, title, manager, enabled, lastLogonDate, memberOf, distinguishedName, userPrincipalName, employeeID @adParams
                 
                 foreach ($user in $users) {
                     # Skip disabled users if configured
