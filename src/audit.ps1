@@ -260,8 +260,14 @@ if (-not $PrivilegeOnly) {
                             if ($group.Attributes["member"] -and $group.Attributes["member"].Count -gt 0) {
                                 foreach ($memberDN in $group.Attributes["member"]) {
                                     try {
-                                        # Convert memberDN to string explicitly
-                                        $memberDNString = $memberDN.ToString()
+                                        # Convert memberDN byte array to string properly
+                                        $memberDNString = ""
+                                        if ($memberDN -is [byte[]]) {
+                                            $memberDNString = [System.Text.Encoding]::UTF8.GetString($memberDN)
+                                        } else {
+                                            $memberDNString = $memberDN.ToString()
+                                        }
+                                        
                                         $userEntry = Invoke-LdapSearch -Ldap $ldapConnection -BaseDN $memberDNString -Filter "(objectClass=user)" -Attributes @("givenName","sn","mail") | Select-Object -First 1
                                         
                                         if ($userEntry) {
