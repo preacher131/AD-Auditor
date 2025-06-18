@@ -25,6 +25,15 @@ Write-Host "=== AD Entitlement Review System ===" -ForegroundColor Cyan
 Write-Host "PowerShell Version: $($PSVersionTable.PSVersion)" -ForegroundColor Yellow
 Write-Host "Review ID: $ReviewID" -ForegroundColor Green
 
+# Display processing mode
+if ($PrivilegeOnly) {
+    Write-Host "Processing Mode: PRIVILEGE ONLY" -ForegroundColor Magenta
+} elseif ($GroupsOnly) {
+    Write-Host "Processing Mode: GROUPS ONLY" -ForegroundColor Magenta
+} else {
+    Write-Host "Processing Mode: FULL AUDIT (Groups + Privileges)" -ForegroundColor Magenta
+}
+
 # Import LDAP module
 try {
     $ldapModulePath = Join-Path $scriptPath "Modules\LDAP.psm1"
@@ -773,8 +782,9 @@ function Get-LogicalGroupOwnerInformation {
     return $bestOwnerInfo
 }
 
-# Process groups
-Write-Host "Processing groups..." -ForegroundColor Cyan
+# Process groups (skip if PrivilegeOnly mode)
+if (-not $PrivilegeOnly) {
+    Write-Host "Processing groups..." -ForegroundColor Cyan
 
 foreach ($groupConfig in $groupsConfig.groups) {
     $ouPath = $groupConfig.path
@@ -1137,6 +1147,10 @@ foreach ($groupConfig in $groupsConfig.groups) {
     }
 }
 
+} else {
+    Write-Host "Skipping group processing (PrivilegeOnly mode)" -ForegroundColor Yellow
+}
+
 Write-Host "Found $($packages1.Count) groups with $($packageMembers1.Count) members" -ForegroundColor Green
 
 # Process privileges
@@ -1236,28 +1250,34 @@ $outputFiles = @{
     PrivilegeGroups = $config.OutputFiles.PrivilegeGroups -replace '{ReviewId}', $ReviewID
 }
 
-if ($packages1.Count -gt 0) {
-    $filePath = Join-Path $outputPath $outputFiles.Packages1
-    $packages1 | Export-Csv -Path $filePath -NoTypeInformation
-    Write-Host "Exported $($outputFiles.Packages1) with $($packages1.Count) records" -ForegroundColor Green
+# Export group-related files (skip if PrivilegeOnly)
+if (-not $PrivilegeOnly) {
+    if ($packages1.Count -gt 0) {
+        $filePath = Join-Path $outputPath $outputFiles.Packages1
+        $packages1 | Export-Csv -Path $filePath -NoTypeInformation
+        Write-Host "Exported $($outputFiles.Packages1) with $($packages1.Count) records" -ForegroundColor Green
+    }
+
+    if ($packageMembers1.Count -gt 0) {
+        $filePath = Join-Path $outputPath $outputFiles.PackageMembers1
+        $packageMembers1 | Export-Csv -Path $filePath -NoTypeInformation
+        Write-Host "Exported $($outputFiles.PackageMembers1) with $($packageMembers1.Count) records" -ForegroundColor Green
+    }
 }
 
-if ($packageMembers1.Count -gt 0) {
-    $filePath = Join-Path $outputPath $outputFiles.PackageMembers1
-    $packageMembers1 | Export-Csv -Path $filePath -NoTypeInformation
-    Write-Host "Exported $($outputFiles.PackageMembers1) with $($packageMembers1.Count) records" -ForegroundColor Green
-}
+# Export privilege-related files (skip if GroupsOnly)  
+if (-not $GroupsOnly) {
+    if ($packages2.Count -gt 0) {
+        $filePath = Join-Path $outputPath $outputFiles.Packages2
+        $packages2 | Export-Csv -Path $filePath -NoTypeInformation
+        Write-Host "Exported $($outputFiles.Packages2) with $($packages2.Count) records" -ForegroundColor Green
+    }
 
-if ($packages2.Count -gt 0) {
-    $filePath = Join-Path $outputPath $outputFiles.Packages2
-    $packages2 | Export-Csv -Path $filePath -NoTypeInformation
-    Write-Host "Exported $($outputFiles.Packages2) with $($packages2.Count) records" -ForegroundColor Green
-}
-
-if ($privilegeGroups.Count -gt 0) {
-    $filePath = Join-Path $outputPath $outputFiles.PrivilegeGroups
-    $privilegeGroups | Export-Csv -Path $filePath -NoTypeInformation
-    Write-Host "Exported $($outputFiles.PrivilegeGroups) with $($privilegeGroups.Count) records" -ForegroundColor Green
+    if ($privilegeGroups.Count -gt 0) {
+        $filePath = Join-Path $outputPath $outputFiles.PrivilegeGroups
+        $privilegeGroups | Export-Csv -Path $filePath -NoTypeInformation
+        Write-Host "Exported $($outputFiles.PrivilegeGroups) with $($privilegeGroups.Count) records" -ForegroundColor Green
+    }
 }
 
 Write-Host ""
