@@ -1,0 +1,50 @@
+{
+  "ouPaths": [
+    "OU=Users,OU=Corporate,DC=yourdomain,DC=com",
+    "OU=Service Accounts,OU=IT,DC=yourdomain,DC=com",
+    "OU=Contractors,OU=External,DC=yourdomain,DC=com"
+  ],
+  "exclude": [
+    "CN=Domain Users,CN=Users,DC=yourdomain,DC=com",
+    "CN=Authenticated Users,CN=Builtin,DC=yourdomain,DC=com",
+    "CN=Everyone,CN=Builtin,DC=yourdomain,DC=com",
+    "CN=Users,CN=Builtin,DC=yourdomain,DC=com"
+  ],
+  "userAttributes": [
+    "sAMAccountName",
+    "displayName", 
+    "mail",
+    "department",
+    "title",
+    "manager",
+    "enabled",
+    "lastLogonDate",
+    "memberOf",
+    "distinguishedName",
+    "userPrincipalName",
+    "employeeID"
+  ],
+  "processingOptions": {
+    "includeDisabledUsers": false,
+    "maxRecursionDepth": 10,
+    "excludeSystemGroups": true,
+    "includeNestedGroupMembership": true,
+    "filterByLastLogon": false,
+    "lastLogonDays": 90
+  },
+  "outputSettings": {
+    "packages2FileName": "Packages2_{ReviewId}.csv",
+    "privilegeGroupsFileName": "PrivilegeGroups_{ReviewId}.csv",
+    "includeEmptyUsers": false,
+    "sortByUserName": true,
+    "includeUserMetadata": true,
+    "groupDescriptionTruncate": 255
+  },
+  "_comments": {
+    "ouPaths": "Array of LDAP DNs for OUs containing users to audit - UPDATE THESE PATHS!",
+    "exclude": "Array of group DNs to exclude from privilege analysis - UPDATE THESE PATHS!",
+    "userAttributes": "AD attributes to retrieve for each user",
+    "processingOptions.includeDisabledUsers": "false to skip disabled user accounts",
+    "processingOptions.filterByLastLogon": "true to filter users by last logon date"
+  }
+} 

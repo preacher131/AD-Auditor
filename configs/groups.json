@@ -1,0 +1,71 @@
+{
+  "groups": [
+    {
+      "path": "OU=Application Groups,OU=Security Groups,DC=yourdomain,DC=com",
+      "category": "Applications",
+      "Logical": {
+        "isLogical": true,
+        "grouping": {
+          "-ro": "Read-Only",
+          "-ch": "Change",
+          "-admin": "Administrator"
+        }
+      }
+    },
+    {
+      "path": "OU=Department Groups,OU=Security Groups,DC=yourdomain,DC=com",
+      "category": "Departments",
+      "Logical": {
+        "isLogical": false
+      }
+    }
+  ],
+  "ownerRegexPatterns": [
+    {
+      "name": "Primary Owner Email",
+      "pattern": "Primary Owner:\\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,})",
+      "captureGroup": 1,
+      "description": "Extracts primary owner email from group info field"
+    },
+    {
+      "name": "Secondary Owner Email", 
+      "pattern": "Secondary Owner:\\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,})",
+      "captureGroup": 1,
+      "description": "Extracts secondary owner email from group info field"
+    },
+    {
+      "name": "Owner Email Generic",
+      "pattern": "Owner:\\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,})",
+      "captureGroup": 1, 
+      "description": "Extracts owner email when no primary/secondary distinction"
+    },
+    {
+      "name": "Primary Owner Name",
+      "pattern": "Primary Owner:\\s*([A-Za-z]+)\\s+([A-Za-z]+)",
+      "captureGroup": 0,
+      "description": "Extracts primary owner name for AD lookup"
+    }
+  ],
+  "processingOptions": {
+    "includeNestedGroups": true,
+    "maxRecursionDepth": 10,
+    "excludeDisabledGroups": true,
+    "excludeSystemGroups": true,
+    "includeMembershipSource": true,
+    "generateReviewPackageIds": true
+  },
+  "outputSettings": {
+    "packages1FileName": "Packages1_{ReviewId}.csv",
+    "packageMembers1FileName": "PackageMembers1_{ReviewId}.csv",
+    "includeEmptyGroups": false,
+    "sortByGroupName": true,
+    "includeGroupMetadata": true
+  },
+  "_comments": {
+    "path": "Full LDAP DN of the OU containing groups to audit - UPDATE THESE PATHS!",
+    "category": "Descriptive category for reporting",
+    "Logical.isLogical": "true if groups follow suffix naming conventions",
+    "Logical.grouping": "Map of suffixes to access level descriptions",
+    "ownerRegexPatterns": "Regex patterns to extract owner information from group descriptions"
+  }
+} 
