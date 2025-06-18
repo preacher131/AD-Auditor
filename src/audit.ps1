@@ -99,12 +99,12 @@ function Get-SimpleObjectGuid {
     
     try {
         if ($IsLdap) {
-            if ($Object.Attributes -and $Object.Attributes.ContainsKey("objectGUID")) {
+            if ($Object.Attributes["objectGUID"] -and $Object.Attributes["objectGUID"].Count -gt 0) {
                 $guidBytes = $Object.Attributes["objectGUID"][0]
                 $guid = New-Object System.Guid -ArgumentList $guidBytes
                 return $guid.ToString()
             }
-            if ($Object.Attributes -and $Object.Attributes.ContainsKey("distinguishedName")) {
+            if ($Object.Attributes["distinguishedName"] -and $Object.Attributes["distinguishedName"].Count -gt 0) {
                 return New-SimpleGuid $Object.Attributes["distinguishedName"][0]
             }
         }
@@ -234,7 +234,7 @@ if (-not $PrivilegeOnly) {
                 $groups = Invoke-LdapSearch -Ldap $ldapConnection -BaseDN $baseDN -Filter $groupFilter -Attributes @("cn","description","member")
                 
                 foreach ($group in $groups) {
-                    if ($group.Attributes.ContainsKey("cn")) {
+                    if ($group.Attributes["cn"] -and $group.Attributes["cn"].Count -gt 0) {
                         $groupName = $group.Attributes["cn"][0]
                         $groupGuid = Get-SimpleObjectGuid $group $true
                         $reviewPackageID = New-SimpleGuid "$groupName|$ReviewID|$groupGuid"
@@ -246,7 +246,7 @@ if (-not $PrivilegeOnly) {
                         $package | Add-Member -MemberType NoteProperty -Name "GroupName" -Value $groupName
                         $package | Add-Member -MemberType NoteProperty -Name "OUPath" -Value $baseDN
                         
-                        if ($group.Attributes.ContainsKey("description")) {
+                        if ($group.Attributes["description"] -and $group.Attributes["description"].Count -gt 0) {
                             $package | Add-Member -MemberType NoteProperty -Name "Description" -Value $group.Attributes["description"][0]
                         }
                         else {
