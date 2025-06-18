@@ -202,24 +202,57 @@ if (-not $PrivilegeOnly) {
                     $packages1 += $package
                     
                     try {
-                        $members = Get-ADGroupMember -Identity $group -Recursive @adParams | Where-Object { $_.objectClass -eq "user" }
+                        # First get direct members (users and groups)
+                        $directMembers = Get-ADGroupMember -Identity $group @adParams
                         
-                        foreach ($member in $members) {
-                            try {
-                                $user = Get-ADUser -Identity $member.distinguishedName -Properties mail, givenName, surname @adParams
-                                
-                                $memberObj = New-Object PSObject
-                                $memberObj | Add-Member -MemberType NoteProperty -Name "FirstName" -Value (Get-SafeValue $user.givenName)
-                                $memberObj | Add-Member -MemberType NoteProperty -Name "LastName" -Value (Get-SafeValue $user.surname)
-                                $memberObj | Add-Member -MemberType NoteProperty -Name "Email" -Value (Get-SafeValue $user.mail)
-                                $memberObj | Add-Member -MemberType NoteProperty -Name "UserID" -Value $user.ObjectGUID.ToString()
-                                $memberObj | Add-Member -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
-                                $memberObj | Add-Member -MemberType NoteProperty -Name "DerivedGroup" -Value $group.Name
-                                
-                                $packageMembers1 += $memberObj
+                        foreach ($directMember in $directMembers) {
+                            if ($directMember.objectClass -eq "user") {
+                                # Direct user member - DerivedGroup should be empty or the main group
+                                try {
+                                    $user = Get-ADUser -Identity $directMember.distinguishedName -Properties mail, givenName, surname @adParams
+                                    
+                                    $memberObj = New-Object PSObject
+                                    $memberObj | Add-Member -MemberType NoteProperty -Name "FirstName" -Value (Get-SafeValue $user.givenName)
+                                    $memberObj | Add-Member -MemberType NoteProperty -Name "LastName" -Value (Get-SafeValue $user.surname)
+                                    $memberObj | Add-Member -MemberType NoteProperty -Name "Email" -Value (Get-SafeValue $user.mail)
+                                    $memberObj | Add-Member -MemberType NoteProperty -Name "UserID" -Value $user.ObjectGUID.ToString()
+                                    $memberObj | Add-Member -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
+                                    $memberObj | Add-Member -MemberType NoteProperty -Name "DerivedGroup" -Value ""  # Direct member, no derived group
+                                    
+                                    $packageMembers1 += $memberObj
+                                }
+                                catch {
+                                    Write-Warning "Failed to process user: $($_.Exception.Message)"
+                                }
                             }
-                            catch {
-                                Write-Warning "Failed to process user: $($_.Exception.Message)"
+                            elseif ($directMember.objectClass -eq "group") {
+                                # Nested group - get its members and set DerivedGroup to this intermediate group
+                                try {
+                                    $nestedGroup = Get-ADGroup -Identity $directMember.distinguishedName @adParams
+                                    $nestedMembers = Get-ADGroupMember -Identity $nestedGroup -Recursive @adParams | Where-Object { $_.objectClass -eq "user" }
+                                    
+                                    foreach ($nestedMember in $nestedMembers) {
+                                        try {
+                                            $user = Get-ADUser -Identity $nestedMember.distinguishedName -Properties mail, givenName, surname @adParams
+                                            
+                                            $memberObj = New-Object PSObject
+                                            $memberObj | Add-Member -MemberType NoteProperty -Name "FirstName" -Value (Get-SafeValue $user.givenName)
+                                            $memberObj | Add-Member -MemberType NoteProperty -Name "LastName" -Value (Get-SafeValue $user.surname)
+                                            $memberObj | Add-Member -MemberType NoteProperty -Name "Email" -Value (Get-SafeValue $user.mail)
+                                            $memberObj | Add-Member -MemberType NoteProperty -Name "UserID" -Value $user.ObjectGUID.ToString()
+                                            $memberObj | Add-Member -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
+                                            $memberObj | Add-Member -MemberType NoteProperty -Name "DerivedGroup" -Value $nestedGroup.Name  # This is the intermediate group
+                                            
+                                            $packageMembers1 += $memberObj
+                                        }
+                                        catch {
+                                            Write-Warning "Failed to process nested user: $($_.Exception.Message)"
+                                        }
+                                    }
+                                }
+                                catch {
+                                    Write-Warning "Failed to process nested group: $($_.Exception.Message)"
+                                }
                             }
                         }
                     }
@@ -268,9 +301,11 @@ if (-not $PrivilegeOnly) {
                                             $memberDNString = $memberDN.ToString()
                                         }
                                         
+                                        # Check if member is a user
                                         $userEntry = Invoke-LdapSearch -Ldap $ldapConnection -BaseDN $memberDNString -Filter "(objectClass=user)" -Attributes @("givenName","sn","mail") | Select-Object -First 1
                                         
                                         if ($userEntry) {
+                                            # Direct user member
                                             $memberObj = New-Object PSObject
                                             
                                             $firstName = ""
@@ -293,9 +328,65 @@ if (-not $PrivilegeOnly) {
                                             $memberObj | Add-Member -MemberType NoteProperty -Name "Email" -Value $email
                                             $memberObj | Add-Member -MemberType NoteProperty -Name "UserID" -Value (Get-SimpleObjectGuid $userEntry $true)
                                             $memberObj | Add-Member -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
-                                            $memberObj | Add-Member -MemberType NoteProperty -Name "DerivedGroup" -Value $groupName
+                                            $memberObj | Add-Member -MemberType NoteProperty -Name "DerivedGroup" -Value ""  # Direct member, no derived group
                                             
                                             $packageMembers1 += $memberObj
+                                        }
+                                        else {
+                                            # Check if member is a group
+                                            $nestedGroupEntry = Invoke-LdapSearch -Ldap $ldapConnection -BaseDN $memberDNString -Filter "(objectClass=group)" -Attributes @("cn","member") | Select-Object -First 1
+                                            
+                                            if ($nestedGroupEntry -and $nestedGroupEntry.Attributes["cn"] -and $nestedGroupEntry.Attributes["cn"].Count -gt 0) {
+                                                $nestedGroupName = $nestedGroupEntry.Attributes["cn"][0]
+                                                
+                                                # Process nested group members
+                                                if ($nestedGroupEntry.Attributes["member"] -and $nestedGroupEntry.Attributes["member"].Count -gt 0) {
+                                                    foreach ($nestedMemberDN in $nestedGroupEntry.Attributes["member"]) {
+                                                        try {
+                                                            # Convert nested memberDN
+                                                            $nestedMemberDNString = ""
+                                                            if ($nestedMemberDN -is [byte[]]) {
+                                                                $nestedMemberDNString = [System.Text.Encoding]::UTF8.GetString($nestedMemberDN)
+                                                            } else {
+                                                                $nestedMemberDNString = $nestedMemberDN.ToString()
+                                                            }
+                                                            
+                                                            $nestedUserEntry = Invoke-LdapSearch -Ldap $ldapConnection -BaseDN $nestedMemberDNString -Filter "(objectClass=user)" -Attributes @("givenName","sn","mail") | Select-Object -First 1
+                                                            
+                                                            if ($nestedUserEntry) {
+                                                                $memberObj = New-Object PSObject
+                                                                
+                                                                $firstName = ""
+                                                                if ($nestedUserEntry.Attributes["givenName"] -and $nestedUserEntry.Attributes["givenName"].Count -gt 0) {
+                                                                    $firstName = $nestedUserEntry.Attributes["givenName"][0]
+                                                                }
+                                                                
+                                                                $lastName = ""
+                                                                if ($nestedUserEntry.Attributes["sn"] -and $nestedUserEntry.Attributes["sn"].Count -gt 0) {
+                                                                    $lastName = $nestedUserEntry.Attributes["sn"][0]
+                                                                }
+                                                                
+                                                                $email = ""
+                                                                if ($nestedUserEntry.Attributes["mail"] -and $nestedUserEntry.Attributes["mail"].Count -gt 0) {
+                                                                    $email = $nestedUserEntry.Attributes["mail"][0]
+                                                                }
+                                                                
+                                                                $memberObj | Add-Member -MemberType NoteProperty -Name "FirstName" -Value $firstName
+                                                                $memberObj | Add-Member -MemberType NoteProperty -Name "LastName" -Value $lastName
+                                                                $memberObj | Add-Member -MemberType NoteProperty -Name "Email" -Value $email
+                                                                $memberObj | Add-Member -MemberType NoteProperty -Name "UserID" -Value (Get-SimpleObjectGuid $nestedUserEntry $true)
+                                                                $memberObj | Add-Member -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
+                                                                $memberObj | Add-Member -MemberType NoteProperty -Name "DerivedGroup" -Value $nestedGroupName  # This is the intermediate group
+                                                                
+                                                                $packageMembers1 += $memberObj
+                                                            }
+                                                        }
+                                                        catch {
+                                                            Write-Warning "Failed to process nested member: $($_.Exception.Message)"
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     catch {
