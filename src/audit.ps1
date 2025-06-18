@@ -1,199 +1,129 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true, HelpMessage="Unique identifier for this review run")]
+    [Parameter(Mandatory=$true)]
     [string]$ReviewID,
     
-    [Parameter(Mandatory=$false, HelpMessage="Process groups only, skip privilege analysis")]
     [switch]$GroupsOnly,
-    
-    [Parameter(Mandatory=$false, HelpMessage="Process privileges only, skip group analysis")]
     [switch]$PrivilegeOnly,
     
-    [Parameter(Mandatory=$false, HelpMessage="Path to configuration directory")]
     [string]$ConfigPath = $null
 )
 
-# PowerShell 5.1 compatibility settings
+# PowerShell 5.1 compatibility
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-# Script initialization
+# Initialize paths
 $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
-
-# Determine config path
 if (-not $ConfigPath) {
-    $ConfigPath = Join-Path -Path $scriptPath -ChildPath "..\configs"
+    $ConfigPath = Join-Path $scriptPath "..\configs"
 }
 
 Write-Host "=== AD Entitlement Review System ===" -ForegroundColor Cyan
-Write-Host "PowerShell Version: $($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Minor)" -ForegroundColor Yellow
+Write-Host "PowerShell Version: $($PSVersionTable.PSVersion)" -ForegroundColor Yellow
+Write-Host "Review ID: $ReviewID" -ForegroundColor Green
 
-#region Module Import
-Write-Host "Loading required modules..." -ForegroundColor Cyan
+# Load LDAP module
 try {
-    $ldapModulePath = Join-Path -Path $scriptPath -ChildPath "Modules\LDAP.psm1"
-    if (Test-Path $ldapModulePath) {
-        Import-Module $ldapModulePath -Force
-        Write-Host "✓ LDAP module loaded successfully" -ForegroundColor Green
-    } else {
-        throw "LDAP module not found at: $ldapModulePath"
-    }
-} catch {
+    $ldapModule = Join-Path $scriptPath "Modules\LDAP.psm1"
+    Import-Module $ldapModule -Force
+    Write-Host "✓ LDAP module loaded" -ForegroundColor Green
+}
+catch {
     Write-Error "Failed to load LDAP module: $($_.Exception.Message)"
     exit 1
 }
-#endregion
 
-#region Configuration Loading
-Write-Host "Loading configuration files..." -ForegroundColor Cyan
+# Load configurations
+Write-Host "Loading configurations..." -ForegroundColor Cyan
 
-# Load main configuration
-$configFile = Join-Path -Path $ConfigPath -ChildPath "config.json"
-if (-not (Test-Path $configFile)) {
-    Write-Error "Configuration file not found: $configFile"
-    exit 1
-}
+$config = $null
+$groupsConfig = $null
+$privilegeConfig = $null
 
 try {
-    $configContent = Get-Content -Path $configFile -Raw
-    $config = ConvertFrom-Json $configContent
-    Write-Host "✓ Main configuration loaded" -ForegroundColor Green
-} catch {
-    Write-Error "Failed to load main configuration: $($_.Exception.Message)"
+    $configFile = Join-Path $ConfigPath "config.json"
+    $config = Get-Content $configFile -Raw | ConvertFrom-Json
+    Write-Host "✓ Main config loaded" -ForegroundColor Green
+    
+    $groupsFile = Join-Path $ConfigPath "groups.json"
+    $groupsConfig = Get-Content $groupsFile -Raw | ConvertFrom-Json
+    Write-Host "✓ Groups config loaded" -ForegroundColor Green
+    
+    $privilegeFile = Join-Path $ConfigPath "privilege.json"
+    $privilegeConfig = Get-Content $privilegeFile -Raw | ConvertFrom-Json
+    Write-Host "✓ Privilege config loaded" -ForegroundColor Green
+}
+catch {
+    Write-Error "Configuration loading failed: $($_.Exception.Message)"
     exit 1
 }
 
-# Load groups configuration
-$groupsFile = Join-Path -Path $ConfigPath -ChildPath "groups.json"
-if (-not (Test-Path $groupsFile)) {
-    Write-Error "Groups configuration file not found: $groupsFile"
-    exit 1
-}
-
-try {
-    $groupsContent = Get-Content -Path $groupsFile -Raw
-    $groupsConfig = ConvertFrom-Json $groupsContent
-    Write-Host "✓ Groups configuration loaded" -ForegroundColor Green
-} catch {
-    Write-Error "Failed to load groups configuration: $($_.Exception.Message)"
-    exit 1
-}
-
-# Load privilege configuration
-$privilegeFile = Join-Path -Path $ConfigPath -ChildPath "privilege.json"
-if (-not (Test-Path $privilegeFile)) {
-    Write-Error "Privilege configuration file not found: $privilegeFile"
-    exit 1
-}
-
-try {
-    $privilegeContent = Get-Content -Path $privilegeFile -Raw
-    $privilegeConfig = ConvertFrom-Json $privilegeContent
-    Write-Host "✓ Privilege configuration loaded" -ForegroundColor Green
-} catch {
-    Write-Error "Failed to load privilege configuration: $($_.Exception.Message)"
-    exit 1
-}
-#endregion
-
-#region Helper Functions
+# Helper functions
 function Get-SafeString {
-    param(
-        [Parameter(Position=0)]
-        $Value,
-        [Parameter(Position=1)]
-        [string]$Default = ""
-    )
-    
-    if ($Value -eq $null) {
+    param($Value, $Default = "")
+    if ($Value -eq $null -or [string]::IsNullOrEmpty($Value)) {
         return $Default
     }
-    
-    if ([string]::IsNullOrEmpty($Value)) {
-        return $Default
-    }
-    
     return $Value.ToString()
 }
 
 function New-DeterministicGuid {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$InputString
-    )
+    param([string]$Input)
     
-    if ([string]::IsNullOrWhiteSpace($InputString)) {
-        # Fallback to random GUID if input is invalid
+    if ([string]::IsNullOrWhiteSpace($Input)) {
         return [System.Guid]::NewGuid().ToString()
     }
     
     try {
-        # Create SHA256 hash
         $hasher = [System.Security.Cryptography.SHA256]::Create()
-        $inputBytes = [System.Text.Encoding]::UTF8.GetBytes($InputString)
+        $inputBytes = [System.Text.Encoding]::UTF8.GetBytes($Input)
         $hashBytes = $hasher.ComputeHash($inputBytes)
         
-        # Take first 16 bytes for GUID
         $guidBytes = New-Object byte[] 16
-        [Array]::Copy($hashBytes, 0, $guidBytes, 0, 16)
+        for ($i = 0; $i -lt 16; $i++) {
+            $guidBytes[$i] = $hashBytes[$i]
+        }
         
-        # Create GUID from bytes
-        $guid = New-Object System.Guid @($guidBytes)
+        $guid = New-Object System.Guid -ArgumentList $guidBytes
         $hasher.Dispose()
-        
         return $guid.ToString()
-    } catch {
-        Write-Warning "Failed to generate deterministic GUID for input '$InputString': $($_.Exception.Message)"
+    }
+    catch {
+        Write-Warning "GUID generation failed for '$Input': $($_.Exception.Message)"
         return [System.Guid]::NewGuid().ToString()
     }
 }
 
 function Get-ObjectGuid {
-    param(
-        [Parameter(Mandatory=$true)]
-        $Object,
-        [Parameter(Mandatory=$false)]
-        [bool]$IsLdapObject = $false
-    )
+    param($Object, [bool]$IsLdap = $false)
     
     try {
-        if ($IsLdapObject) {
-            # LDAP object handling
+        if ($IsLdap) {
             if ($Object.Attributes -and $Object.Attributes.ContainsKey("objectGUID")) {
-                $guidBytes = $Object.Attributes["objectGUID"]
-                                 if ($guidBytes -and $guidBytes.Count -gt 0) {
-                     $guid = New-Object System.Guid @($guidBytes[0])
-                     return $guid.ToString()
-                 }
+                $guidBytes = $Object.Attributes["objectGUID"][0]
+                $guid = New-Object System.Guid -ArgumentList $guidBytes
+                return $guid.ToString()
             }
-            
-            # Fallback to DN-based GUID for LDAP
             if ($Object.Attributes -and $Object.Attributes.ContainsKey("distinguishedName")) {
-                $dn = $Object.Attributes["distinguishedName"][0]
-                return New-DeterministicGuid -InputString $dn
+                return New-DeterministicGuid $Object.Attributes["distinguishedName"][0]
             }
-        } else {
-            # AD Module object handling
+        }
+        else {
             if ($Object.ObjectGUID) {
                 return $Object.ObjectGUID.ToString()
             }
         }
-        
-        # Final fallback
-        return New-DeterministicGuid -InputString $Object.ToString()
-    } catch {
+        return New-DeterministicGuid $Object.ToString()
+    }
+    catch {
         Write-Warning "Failed to get object GUID: $($_.Exception.Message)"
-        return New-DeterministicGuid -InputString $Object.ToString()
+        return New-DeterministicGuid $Object.ToString()
     }
 }
 
-function Get-OwnerInfo {
-    param(
-        [Parameter(Mandatory=$false)]
-        [string]$InfoText = "",
-        [Parameter(Mandatory=$false)]
-        [string]$BaseDN = ""
-    )
+function Get-OwnerEmails {
+    param([string]$InfoText)
     
     $result = @{
         PrimaryOwner = ""
@@ -204,7 +134,6 @@ function Get-OwnerInfo {
         return $result
     }
     
-    # Process regex patterns if available
     if ($groupsConfig.ownerRegexPatterns) {
         foreach ($pattern in $groupsConfig.ownerRegexPatterns) {
             try {
@@ -213,14 +142,17 @@ function Get-OwnerInfo {
                     
                     if ($pattern.name -like "*Primary*" -and [string]::IsNullOrEmpty($result.PrimaryOwner)) {
                         $result.PrimaryOwner = $email
-                    } elseif ($pattern.name -like "*Secondary*" -and [string]::IsNullOrEmpty($result.SecondaryOwner)) {
+                    }
+                    elseif ($pattern.name -like "*Secondary*" -and [string]::IsNullOrEmpty($result.SecondaryOwner)) {
                         $result.SecondaryOwner = $email
-                    } elseif ([string]::IsNullOrEmpty($result.PrimaryOwner)) {
+                    }
+                    elseif ([string]::IsNullOrEmpty($result.PrimaryOwner)) {
                         $result.PrimaryOwner = $email
                     }
                 }
-            } catch {
-                Write-Warning "Failed to process owner pattern '$($pattern.name)': $($_.Exception.Message)"
+            }
+            catch {
+                Write-Warning "Owner pattern processing failed: $($_.Exception.Message)"
             }
         }
     }
@@ -228,13 +160,8 @@ function Get-OwnerInfo {
     return $result
 }
 
-function Get-LogicalInfo {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$GroupName,
-        [Parameter(Mandatory=$true)]
-        $GroupConfig
-    )
+function Get-LogicalGroupInfo {
+    param([string]$GroupName, $GroupConfig)
     
     $result = @{
         IsLogical = $false
@@ -246,14 +173,13 @@ function Get-LogicalInfo {
         return $result
     }
     
-    # Check for logical grouping suffixes
     if ($GroupConfig.Logical.grouping) {
-        $groupingProperties = $GroupConfig.Logical.grouping | Get-Member -MemberType NoteProperty
-        foreach ($prop in $groupingProperties) {
+        $properties = $GroupConfig.Logical.grouping | Get-Member -MemberType NoteProperty
+        foreach ($prop in $properties) {
             $suffix = $prop.Name
             if ($GroupName -like "*$suffix") {
                 $result.IsLogical = $true
-                $result.BaseName = $GroupName -replace [regex]::Escape($suffix) + '$', ''
+                $result.BaseName = $GroupName.Replace($suffix, "")
                 $result.Access = Get-SafeString $GroupConfig.Logical.grouping.$suffix
                 break
             }
@@ -266,21 +192,19 @@ function Get-LogicalInfo {
     
     return $result
 }
-#endregion
 
-#region Connection Setup
-Write-Host "Establishing Active Directory connection..." -ForegroundColor Cyan
+# Connection setup
+Write-Host "Establishing connection..." -ForegroundColor Cyan
 
-# Initialize connection variables
 $useADModule = $false
 $ldapConnection = $null
 $adParams = @{}
 
-# Determine connection type
 $connectionType = "LDAP"
 if ($config.Connection.Type) {
     $connectionType = $config.Connection.Type.ToUpper()
-} elseif ($config.Connection.UseLDAPS) {
+}
+elseif ($config.Connection.UseLDAPS) {
     $connectionType = "LDAPS"
 }
 
@@ -288,57 +212,52 @@ Write-Host "Connection type: $connectionType" -ForegroundColor Yellow
 Write-Host "Domain Controller: $($config.DomainController)" -ForegroundColor Yellow
 
 try {
-    switch ($connectionType) {
-        "ACTIVEDIRECTORY" {
-            try {
-                Import-Module ActiveDirectory -ErrorAction Stop
-                
-                $adParams.Server = $config.DomainController
-                
-                if (-not $config.Connection.UseCurrentUser) {
-                    $securePassword = ConvertTo-SecureString $config.Connection.CredentialProfile.Password -AsPlainText -Force
-                    $domainUser = "$($config.Connection.CredentialProfile.Domain)\$($config.Connection.CredentialProfile.Username)"
-                    $credential = New-Object System.Management.Automation.PSCredential($domainUser, $securePassword)
-                    $adParams.Credential = $credential
-                }
-                
-                # Test connection
-                $null = Get-ADDomain @adParams
-                $useADModule = $true
-                Write-Host "✓ Connected using ActiveDirectory module" -ForegroundColor Green
-                
-            } catch {
-                Write-Warning "ActiveDirectory module failed, falling back to LDAP: $($_.Exception.Message)"
-                $connectionType = "LDAP"
+    if ($connectionType -eq "ACTIVEDIRECTORY") {
+        try {
+            Import-Module ActiveDirectory -ErrorAction Stop
+            
+            $adParams.Server = $config.DomainController
+            
+            if (-not $config.Connection.UseCurrentUser) {
+                $securePassword = ConvertTo-SecureString $config.Connection.CredentialProfile.Password -AsPlainText -Force
+                $domainUser = "$($config.Connection.CredentialProfile.Domain)\$($config.Connection.CredentialProfile.Username)"
+                $credential = New-Object System.Management.Automation.PSCredential($domainUser, $securePassword)
+                $adParams.Credential = $credential
             }
-        }
-        
-        { $_ -in @("LDAP", "LDAPS") } {
-            $useLDAPS = ($connectionType -eq "LDAPS")
             
-            $ldapConnection = New-LdapConnection -Server $config.DomainController -UseLDAPS $useLDAPS -UseCurrentUser $config.Connection.UseCurrentUser -Username $config.Connection.CredentialProfile.Username -Password $config.Connection.CredentialProfile.Password -Domain $config.Connection.CredentialProfile.Domain
-            
-            $useADModule = $false
-            $connectionTypeDisplay = if ($useLDAPS) { "LDAPS" } else { "LDAP" }
-            Write-Host "✓ Connected using $connectionTypeDisplay" -ForegroundColor Green
+            $null = Get-ADDomain @adParams
+            $useADModule = $true
+            Write-Host "✓ Connected using ActiveDirectory module" -ForegroundColor Green
         }
-        
-        default {
-            throw "Unsupported connection type: $connectionType"
+        catch {
+            Write-Warning "ActiveDirectory module failed, falling back to LDAP: $($_.Exception.Message)"
+            $connectionType = "LDAP"
         }
     }
-} catch {
-    Write-Error "Failed to establish AD connection: $($_.Exception.Message)"
+    
+    if ($connectionType -eq "LDAP" -or $connectionType -eq "LDAPS") {
+        $useLDAPS = ($connectionType -eq "LDAPS")
+        
+        $ldapConnection = New-LdapConnection -Server $config.DomainController -UseLDAPS $useLDAPS -UseCurrentUser $config.Connection.UseCurrentUser -Username $config.Connection.CredentialProfile.Username -Password $config.Connection.CredentialProfile.Password -Domain $config.Connection.CredentialProfile.Domain
+        
+        $useADModule = $false
+        Write-Host "✓ Connected using $connectionType" -ForegroundColor Green
+    }
+}
+catch {
+    Write-Error "Failed to establish connection: $($_.Exception.Message)"
     exit 1
 }
-#endregion
 
-#region Processing Functions
-function Process-GroupEntitlements {
-    Write-Host "Processing group entitlements..." -ForegroundColor Cyan
-    
-    $packages1 = @()
-    $packageMembers1 = @()
+# Initialize result collections
+$packages1 = @()
+$packageMembers1 = @()
+$packages2 = @()
+$privilegeGroups = @()
+
+# Process groups
+if (-not $PrivilegeOnly) {
+    Write-Host "Processing groups..." -ForegroundColor Cyan
     
     foreach ($groupConfig in $groupsConfig.groups) {
         $baseDN = Get-SafeString $groupConfig.path
@@ -346,32 +265,29 @@ function Process-GroupEntitlements {
         
         try {
             if ($useADModule) {
-                # ActiveDirectory module processing
                 $groups = Get-ADGroup -Filter * -SearchBase $baseDN -Properties Description, info @adParams
                 
                 foreach ($group in $groups) {
-                    $logicalInfo = Get-LogicalInfo -GroupName $group.Name -GroupConfig $groupConfig
-                    $owners = Get-OwnerInfo -InfoText (Get-SafeString $group.info) -BaseDN $baseDN
-                    $groupGuid = Get-ObjectGuid -Object $group -IsLdapObject $false
-                    $reviewPackageID = New-DeterministicGuid -InputString "$($logicalInfo.BaseName)|$ReviewID|$groupGuid"
+                    $logicalInfo = Get-LogicalGroupInfo $group.Name $groupConfig
+                    $owners = Get-OwnerEmails (Get-SafeString $group.info)
+                    $groupGuid = Get-ObjectGuid $group $false
+                    $reviewPackageID = New-DeterministicGuid "$($logicalInfo.BaseName)|$ReviewID|$groupGuid"
                     
-                    # Create package record
-                    $package = New-Object PSObject -Property @{
-                        ReviewID = $ReviewID
-                        GroupID = $groupGuid
-                        ReviewPackageID = $reviewPackageID
-                        GroupName = $logicalInfo.BaseName
-                        PrimaryOwnerEmail = Get-SafeString $owners.PrimaryOwner
-                        SecondaryOwnerEmail = Get-SafeString $owners.SecondaryOwner
-                        OUPath = $baseDN
-                        Tag = Get-SafeString $groupConfig.category
-                        Description = Get-SafeString $group.Description
-                        LogicalGrouping = $logicalInfo.IsLogical
-                        LogicalAccess = Get-SafeString $logicalInfo.Access
-                    }
+                    $package = New-Object PSObject
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "ReviewID" -Value $ReviewID
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "GroupID" -Value $groupGuid
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "GroupName" -Value $logicalInfo.BaseName
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "PrimaryOwnerEmail" -Value (Get-SafeString $owners.PrimaryOwner)
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "SecondaryOwnerEmail" -Value (Get-SafeString $owners.SecondaryOwner)
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "OUPath" -Value $baseDN
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "Tag" -Value (Get-SafeString $groupConfig.category)
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "Description" -Value (Get-SafeString $group.Description)
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "LogicalGrouping" -Value $logicalInfo.IsLogical
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "LogicalAccess" -Value (Get-SafeString $logicalInfo.Access)
+                    
                     $packages1 += $package
                     
-                    # Process group members
                     try {
                         $members = Get-ADGroupMember -Identity $group -Recursive @adParams | Where-Object { $_.objectClass -eq "user" }
                         
@@ -379,7 +295,6 @@ function Process-GroupEntitlements {
                             try {
                                 $user = Get-ADUser -Identity $member.distinguishedName -Properties Department, Title, Manager, mail, givenName, surname @adParams
                                 
-                                # Get manager information
                                 $managerName = ""
                                 $managerEmail = ""
                                 
@@ -388,8 +303,9 @@ function Process-GroupEntitlements {
                                         $mgr = Get-ADUser -Identity $user.Manager -Properties DisplayName, mail @adParams
                                         $managerName = Get-SafeString $mgr.DisplayName
                                         $managerEmail = Get-SafeString $mgr.mail
-                                    } catch {
-                                        # Manager lookup failed, continue with empty values
+                                    }
+                                    catch {
+                                        # Manager lookup failed
                                     }
                                 }
                                 
@@ -397,33 +313,33 @@ function Process-GroupEntitlements {
                                 $lastName = Get-SafeString $user.surname
                                 $fullName = "$firstName $lastName".Trim()
                                 
-                                $memberObj = New-Object PSObject -Property @{
-                                    FirstName = $firstName
-                                    LastName = $lastName
-                                    Email = Get-SafeString $user.mail
-                                    UserID = $user.ObjectGUID.ToString()
-                                    Username = $fullName
-                                    Department = Get-SafeString $user.Department
-                                    JobTitle = Get-SafeString $user.Title
-                                    ManagerName = $managerName
-                                    ManagerEmail = $managerEmail
-                                    ReviewPackageID = $reviewPackageID
-                                    DerivedGroup = $group.Name
-                                    LogicalAccess = Get-SafeString $logicalInfo.Access
-                                }
-                                $packageMembers1 += $memberObj
+                                $memberObj = New-Object PSObject
+                                Add-Member -InputObject $memberObj -MemberType NoteProperty -Name "FirstName" -Value $firstName
+                                Add-Member -InputObject $memberObj -MemberType NoteProperty -Name "LastName" -Value $lastName
+                                Add-Member -InputObject $memberObj -MemberType NoteProperty -Name "Email" -Value (Get-SafeString $user.mail)
+                                Add-Member -InputObject $memberObj -MemberType NoteProperty -Name "UserID" -Value $user.ObjectGUID.ToString()
+                                Add-Member -InputObject $memberObj -MemberType NoteProperty -Name "Username" -Value $fullName
+                                Add-Member -InputObject $memberObj -MemberType NoteProperty -Name "Department" -Value (Get-SafeString $user.Department)
+                                Add-Member -InputObject $memberObj -MemberType NoteProperty -Name "JobTitle" -Value (Get-SafeString $user.Title)
+                                Add-Member -InputObject $memberObj -MemberType NoteProperty -Name "ManagerName" -Value $managerName
+                                Add-Member -InputObject $memberObj -MemberType NoteProperty -Name "ManagerEmail" -Value $managerEmail
+                                Add-Member -InputObject $memberObj -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
+                                Add-Member -InputObject $memberObj -MemberType NoteProperty -Name "DerivedGroup" -Value $group.Name
+                                Add-Member -InputObject $memberObj -MemberType NoteProperty -Name "LogicalAccess" -Value (Get-SafeString $logicalInfo.Access)
                                 
-                            } catch {
-                                Write-Warning "Failed to process user '$($member.distinguishedName)': $($_.Exception.Message)"
+                                $packageMembers1 += $memberObj
+                            }
+                            catch {
+                                Write-Warning "Failed to process user: $($_.Exception.Message)"
                             }
                         }
-                    } catch {
-                        Write-Warning "Failed to get members for group '$($group.Name)': $($_.Exception.Message)"
+                    }
+                    catch {
+                        Write-Warning "Failed to get group members: $($_.Exception.Message)"
                     }
                 }
-                
-            } else {
-                # LDAP processing
+            }
+            else {
                 $groupFilter = "(objectClass=group)"
                 $groups = Invoke-LdapSearch -Ldap $ldapConnection -BaseDN $baseDN -Filter $groupFilter -Attributes @("cn","description","info","distinguishedName","member")
                 
@@ -437,39 +353,37 @@ function Process-GroupEntitlements {
                         continue
                     }
                     
-                    $logicalInfo = Get-LogicalInfo -GroupName $groupName -GroupConfig $groupConfig
+                    $logicalInfo = Get-LogicalGroupInfo $groupName $groupConfig
                     
                     $infoText = ""
                     if ($group.Attributes.ContainsKey("info")) {
                         $infoText = $group.Attributes["info"][0]
                     }
                     
-                    $owners = Get-OwnerInfo -InfoText $infoText -BaseDN $baseDN
-                    $groupGuid = Get-ObjectGuid -Object $group -IsLdapObject $true
-                    $reviewPackageID = New-DeterministicGuid -InputString "$($logicalInfo.BaseName)|$ReviewID|$groupGuid"
+                    $owners = Get-OwnerEmails $infoText
+                    $groupGuid = Get-ObjectGuid $group $true
+                    $reviewPackageID = New-DeterministicGuid "$($logicalInfo.BaseName)|$ReviewID|$groupGuid"
                     
                     $groupDescription = ""
                     if ($group.Attributes.ContainsKey("description")) {
                         $groupDescription = Get-SafeString $group.Attributes["description"][0]
                     }
                     
-                    # Create package record
-                    $package = New-Object PSObject -Property @{
-                        ReviewID = $ReviewID
-                        GroupID = $groupGuid
-                        ReviewPackageID = $reviewPackageID
-                        GroupName = $logicalInfo.BaseName
-                        PrimaryOwnerEmail = Get-SafeString $owners.PrimaryOwner
-                        SecondaryOwnerEmail = Get-SafeString $owners.SecondaryOwner
-                        OUPath = $baseDN
-                        Tag = Get-SafeString $groupConfig.category
-                        Description = $groupDescription
-                        LogicalGrouping = $logicalInfo.IsLogical
-                        LogicalAccess = Get-SafeString $logicalInfo.Access
-                    }
+                    $package = New-Object PSObject
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "ReviewID" -Value $ReviewID
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "GroupID" -Value $groupGuid
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "GroupName" -Value $logicalInfo.BaseName
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "PrimaryOwnerEmail" -Value (Get-SafeString $owners.PrimaryOwner)
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "SecondaryOwnerEmail" -Value (Get-SafeString $owners.SecondaryOwner)
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "OUPath" -Value $baseDN
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "Tag" -Value (Get-SafeString $groupConfig.category)
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "Description" -Value $groupDescription
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "LogicalGrouping" -Value $logicalInfo.IsLogical
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "LogicalAccess" -Value (Get-SafeString $logicalInfo.Access)
+                    
                     $packages1 += $package
                     
-                    # Process group members
                     try {
                         if ($group.Attributes.ContainsKey("member")) {
                             foreach ($memberDN in $group.Attributes["member"]) {
@@ -477,7 +391,6 @@ function Process-GroupEntitlements {
                                     $userEntry = Invoke-LdapSearch -Ldap $ldapConnection -BaseDN $memberDN -Filter "(objectClass=user)" -Attributes @("givenName","sn","mail","department","title","manager","displayName") | Select-Object -First 1
                                     
                                     if ($userEntry) {
-                                        # Get manager information
                                         $managerName = ""
                                         $managerEmail = ""
                                         
@@ -493,8 +406,9 @@ function Process-GroupEntitlements {
                                                         $managerEmail = Get-SafeString $managerEntry.Attributes["mail"][0]
                                                     }
                                                 }
-                                            } catch {
-                                                # Manager lookup failed, continue with empty values
+                                            }
+                                            catch {
+                                                # Manager lookup failed
                                             }
                                         }
                                         
@@ -522,75 +436,67 @@ function Process-GroupEntitlements {
                                         
                                         $fullName = "$firstName $lastName".Trim()
                                         
-                                        $memberObj = New-Object PSObject -Property @{
-                                            FirstName = $firstName
-                                            LastName = $lastName
-                                            Email = $email
-                                            UserID = Get-ObjectGuid -Object $userEntry -IsLdapObject $true
-                                            Username = $fullName
-                                            Department = $department
-                                            JobTitle = $jobTitle
-                                            ManagerName = $managerName
-                                            ManagerEmail = $managerEmail
-                                            ReviewPackageID = $reviewPackageID
-                                            DerivedGroup = $groupName
-                                            LogicalAccess = Get-SafeString $logicalInfo.Access
-                                        }
+                                        $memberObj = New-Object PSObject
+                                        Add-Member -InputObject $memberObj -MemberType NoteProperty -Name "FirstName" -Value $firstName
+                                        Add-Member -InputObject $memberObj -MemberType NoteProperty -Name "LastName" -Value $lastName
+                                        Add-Member -InputObject $memberObj -MemberType NoteProperty -Name "Email" -Value $email
+                                        Add-Member -InputObject $memberObj -MemberType NoteProperty -Name "UserID" -Value (Get-ObjectGuid $userEntry $true)
+                                        Add-Member -InputObject $memberObj -MemberType NoteProperty -Name "Username" -Value $fullName
+                                        Add-Member -InputObject $memberObj -MemberType NoteProperty -Name "Department" -Value $department
+                                        Add-Member -InputObject $memberObj -MemberType NoteProperty -Name "JobTitle" -Value $jobTitle
+                                        Add-Member -InputObject $memberObj -MemberType NoteProperty -Name "ManagerName" -Value $managerName
+                                        Add-Member -InputObject $memberObj -MemberType NoteProperty -Name "ManagerEmail" -Value $managerEmail
+                                        Add-Member -InputObject $memberObj -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
+                                        Add-Member -InputObject $memberObj -MemberType NoteProperty -Name "DerivedGroup" -Value $groupName
+                                        Add-Member -InputObject $memberObj -MemberType NoteProperty -Name "LogicalAccess" -Value (Get-SafeString $logicalInfo.Access)
+                                        
                                         $packageMembers1 += $memberObj
                                     }
-                                } catch {
-                                    Write-Warning "Failed to process member '$memberDN': $($_.Exception.Message)"
+                                }
+                                catch {
+                                    Write-Warning "Failed to process member: $($_.Exception.Message)"
                                 }
                             }
                         }
-                    } catch {
-                        Write-Warning "Failed to process members for group '$groupName': $($_.Exception.Message)"
+                    }
+                    catch {
+                        Write-Warning "Failed to process group members: $($_.Exception.Message)"
                     }
                 }
             }
-            
-        } catch {
+        }
+        catch {
             Write-Warning "Failed to process OU '$baseDN': $($_.Exception.Message)"
         }
     }
     
-    Write-Host "  Found $($packages1.Count) groups with $($packageMembers1.Count) total members" -ForegroundColor Green
-    
-    return @{
-        Packages1 = $packages1
-        PackageMembers1 = $packageMembers1
-    }
+    Write-Host "  Found $($packages1.Count) groups with $($packageMembers1.Count) members" -ForegroundColor Green
 }
 
-function Process-PrivilegeEntitlements {
-    Write-Host "Processing privilege entitlements..." -ForegroundColor Cyan
-    
-    $packages2 = @()
-    $privilegeGroups = @()
+# Process privileges
+if (-not $GroupsOnly) {
+    Write-Host "Processing privileges..." -ForegroundColor Cyan
     
     foreach ($ouPath in $privilegeConfig.ouPaths) {
         Write-Host "  Processing OU: $ouPath" -ForegroundColor Yellow
         
         try {
             if ($useADModule) {
-                # ActiveDirectory module processing
                 $users = Get-ADUser -Filter * -SearchBase $ouPath -Properties memberOf, DisplayName @adParams
                 
                 foreach ($user in $users) {
-                    $userGuid = Get-ObjectGuid -Object $user -IsLdapObject $false
-                    $reviewPackageID = New-DeterministicGuid -InputString "$($user.SamAccountName)|$ReviewID|$userGuid"
+                    $userGuid = Get-ObjectGuid $user $false
+                    $reviewPackageID = New-DeterministicGuid "$($user.SamAccountName)|$ReviewID|$userGuid"
                     
-                    # Create user package record
-                    $package = New-Object PSObject -Property @{
-                        ReviewID = $ReviewID
-                        GroupID = $userGuid
-                        GroupName = Get-SafeString $user.DisplayName
-                        OUPath = $ouPath
-                        ReviewPackageID = $reviewPackageID
-                    }
+                    $package = New-Object PSObject
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "ReviewID" -Value $ReviewID
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "GroupID" -Value $userGuid
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "GroupName" -Value (Get-SafeString $user.DisplayName)
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "OUPath" -Value $ouPath
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
+                    
                     $packages2 += $package
                     
-                    # Process user's group memberships
                     $memberOfGroups = @()
                     if ($user.memberOf) {
                         $memberOfGroups = $user.memberOf
@@ -608,53 +514,51 @@ function Process-PrivilegeEntitlements {
                         if (-not $shouldExclude) {
                             try {
                                 $group = Get-ADGroup -Identity $groupDN -Properties Description @adParams
-                                $groupGuid = Get-ObjectGuid -Object $group -IsLdapObject $false
+                                $groupGuid = Get-ObjectGuid $group $false
                                 
-                                $privilegeGroup = New-Object PSObject -Property @{
-                                    GroupName = Get-SafeString $group.Name
-                                    GroupID = $groupGuid
-                                    ReviewPackageID = $reviewPackageID
-                                    Description = Get-SafeString $group.Description
-                                }
+                                $privilegeGroup = New-Object PSObject
+                                Add-Member -InputObject $privilegeGroup -MemberType NoteProperty -Name "GroupName" -Value (Get-SafeString $group.Name)
+                                Add-Member -InputObject $privilegeGroup -MemberType NoteProperty -Name "GroupID" -Value $groupGuid
+                                Add-Member -InputObject $privilegeGroup -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
+                                Add-Member -InputObject $privilegeGroup -MemberType NoteProperty -Name "Description" -Value (Get-SafeString $group.Description)
+                                
                                 $privilegeGroups += $privilegeGroup
-                            } catch {
-                                Write-Warning "Failed to get group info for '$groupDN': $($_.Exception.Message)"
+                            }
+                            catch {
+                                Write-Warning "Failed to get group info: $($_.Exception.Message)"
                             }
                         }
                     }
                 }
-                
-            } else {
-                # LDAP processing
+            }
+            else {
                 $userFilter = "(objectClass=user)"
                 $users = Invoke-LdapSearch -Ldap $ldapConnection -BaseDN $ouPath -Filter $userFilter -Attributes @("sAMAccountName","displayName","distinguishedName","memberOf")
                 
                 foreach ($user in $users) {
-                    $userGuid = Get-ObjectGuid -Object $user -IsLdapObject $true
+                    $userGuid = Get-ObjectGuid $user $true
                     
                     $samAccountName = ""
                     if ($user.Attributes.ContainsKey("sAMAccountName")) {
                         $samAccountName = Get-SafeString $user.Attributes["sAMAccountName"][0]
                     }
                     
-                    $reviewPackageID = New-DeterministicGuid -InputString "$samAccountName|$ReviewID|$userGuid"
+                    $reviewPackageID = New-DeterministicGuid "$samAccountName|$ReviewID|$userGuid"
                     
                     $displayName = $samAccountName
                     if ($user.Attributes.ContainsKey("displayName")) {
                         $displayName = Get-SafeString $user.Attributes["displayName"][0]
                     }
                     
-                    # Create user package record
-                    $package = New-Object PSObject -Property @{
-                        ReviewID = $ReviewID
-                        GroupID = $userGuid
-                        GroupName = $displayName
-                        OUPath = $ouPath
-                        ReviewPackageID = $reviewPackageID
-                    }
+                    $package = New-Object PSObject
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "ReviewID" -Value $ReviewID
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "GroupID" -Value $userGuid
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "GroupName" -Value $displayName
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "OUPath" -Value $ouPath
+                    Add-Member -InputObject $package -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
+                    
                     $packages2 += $package
                     
-                    # Process user's group memberships
                     $memberOfGroups = @()
                     if ($user.Attributes.ContainsKey("memberOf")) {
                         $memberOfGroups = $user.Attributes["memberOf"]
@@ -673,7 +577,7 @@ function Process-PrivilegeEntitlements {
                             try {
                                 $groupEntry = Invoke-LdapSearch -Ldap $ldapConnection -BaseDN $groupDN -Filter "(objectClass=group)" -Attributes @("cn","description","distinguishedName") | Select-Object -First 1
                                 if ($groupEntry) {
-                                    $groupGuid = Get-ObjectGuid -Object $groupEntry -IsLdapObject $true
+                                    $groupGuid = Get-ObjectGuid $groupEntry $true
                                     
                                     $groupName = ""
                                     if ($groupEntry.Attributes.ContainsKey("cn")) {
@@ -685,139 +589,88 @@ function Process-PrivilegeEntitlements {
                                         $groupDescription = Get-SafeString $groupEntry.Attributes["description"][0]
                                     }
                                     
-                                    $privilegeGroup = New-Object PSObject -Property @{
-                                        GroupName = $groupName
-                                        GroupID = $groupGuid
-                                        ReviewPackageID = $reviewPackageID
-                                        Description = $groupDescription
-                                    }
+                                    $privilegeGroup = New-Object PSObject
+                                    Add-Member -InputObject $privilegeGroup -MemberType NoteProperty -Name "GroupName" -Value $groupName
+                                    Add-Member -InputObject $privilegeGroup -MemberType NoteProperty -Name "GroupID" -Value $groupGuid
+                                    Add-Member -InputObject $privilegeGroup -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
+                                    Add-Member -InputObject $privilegeGroup -MemberType NoteProperty -Name "Description" -Value $groupDescription
+                                    
                                     $privilegeGroups += $privilegeGroup
                                 }
-                            } catch {
-                                Write-Warning "Failed to get group info for '$groupDN': $($_.Exception.Message)"
+                            }
+                            catch {
+                                Write-Warning "Failed to get group info: $($_.Exception.Message)"
                             }
                         }
                     }
                 }
             }
-            
-        } catch {
+        }
+        catch {
             Write-Warning "Failed to process OU '$ouPath': $($_.Exception.Message)"
         }
     }
     
-    Write-Host "  Found $($packages2.Count) users with $($privilegeGroups.Count) total group memberships" -ForegroundColor Green
-    
-    return @{
-        Packages2 = $packages2
-        PrivilegeGroups = $privilegeGroups
-    }
+    Write-Host "  Found $($packages2.Count) users with $($privilegeGroups.Count) group memberships" -ForegroundColor Green
 }
-#endregion
 
-#region Main Execution
-try {
-    Write-Host ""
-    Write-Host "Starting AD Entitlement Review for ReviewID: $ReviewID" -ForegroundColor Green
-    Write-Host ("=" * 60) -ForegroundColor Green
-    
-    # Initialize result collections
-    $allResults = @{
-        Packages1 = @()
-        PackageMembers1 = @()
-        Packages2 = @()
-        PrivilegeGroups = @()
-    }
-    
-    # Process groups if not privilege-only
-    if (-not $PrivilegeOnly) {
-        $groupResults = Process-GroupEntitlements
-        $allResults.Packages1 = $groupResults.Packages1
-        $allResults.PackageMembers1 = $groupResults.PackageMembers1
-    }
-    
-    # Process privileges if not groups-only
-    if (-not $GroupsOnly) {
-        $privilegeResults = Process-PrivilegeEntitlements
-        $allResults.Packages2 = $privilegeResults.Packages2
-        $allResults.PrivilegeGroups = $privilegeResults.PrivilegeGroups
-    }
-    
-    # Determine output path
-    $outputPath = $config.OutputFolder
-    if ($config.OutputFolder -match "^\.\.") {
-        $outputPath = Join-Path -Path $scriptPath -ChildPath $config.OutputFolder
-    }
-    
-    # Create output directory if needed
-    if (-not (Test-Path $outputPath)) {
-        New-Item -ItemType Directory -Path $outputPath -Force | Out-Null
-        Write-Host "Created output directory: $outputPath" -ForegroundColor Yellow
-    }
-    
-    # Generate output file names
-    Write-Host ""
-    Write-Host "Generating output files..." -ForegroundColor Cyan
-    
-    $outputFiles = @{
-        Packages1 = $config.OutputFiles.Packages1 -replace '{ReviewId}', $ReviewID
-        PackageMembers1 = $config.OutputFiles.PackageMembers1 -replace '{ReviewId}', $ReviewID
-        Packages2 = $config.OutputFiles.Packages2 -replace '{ReviewId}', $ReviewID
-        PrivilegeGroups = $config.OutputFiles.PrivilegeGroups -replace '{ReviewId}', $ReviewID
-    }
-    
-    # Export CSV files
-    if ($allResults.Packages1.Count -gt 0) {
-        $filePath = Join-Path -Path $outputPath -ChildPath $outputFiles.Packages1
-        $allResults.Packages1 | Export-Csv -Path $filePath -NoTypeInformation
-        Write-Host "  ✓ $($outputFiles.Packages1) ($($allResults.Packages1.Count) records)" -ForegroundColor Green
-    } else {
-        Write-Host "  ⚠ No group packages to export" -ForegroundColor Yellow
-    }
-    
-    if ($allResults.PackageMembers1.Count -gt 0) {
-        $filePath = Join-Path -Path $outputPath -ChildPath $outputFiles.PackageMembers1
-        $allResults.PackageMembers1 | Export-Csv -Path $filePath -NoTypeInformation
-        Write-Host "  ✓ $($outputFiles.PackageMembers1) ($($allResults.PackageMembers1.Count) records)" -ForegroundColor Green
-    } else {
-        Write-Host "  ⚠ No package members to export" -ForegroundColor Yellow
-    }
-    
-    if ($allResults.Packages2.Count -gt 0) {
-        $filePath = Join-Path -Path $outputPath -ChildPath $outputFiles.Packages2
-        $allResults.Packages2 | Export-Csv -Path $filePath -NoTypeInformation
-        Write-Host "  ✓ $($outputFiles.Packages2) ($($allResults.Packages2.Count) records)" -ForegroundColor Green
-    } else {
-        Write-Host "  ⚠ No privilege packages to export" -ForegroundColor Yellow
-    }
-    
-    if ($allResults.PrivilegeGroups.Count -gt 0) {
-        $filePath = Join-Path -Path $outputPath -ChildPath $outputFiles.PrivilegeGroups
-        $allResults.PrivilegeGroups | Export-Csv -Path $filePath -NoTypeInformation
-        Write-Host "  ✓ $($outputFiles.PrivilegeGroups) ($($allResults.PrivilegeGroups.Count) records)" -ForegroundColor Green
-    } else {
-        Write-Host "  ⚠ No privilege groups to export" -ForegroundColor Yellow
-    }
-    
-    Write-Host ""
-    Write-Host ("=" * 60) -ForegroundColor Green
-    Write-Host "✓ AD Entitlement Review completed successfully!" -ForegroundColor Green
-    Write-Host "Output files saved to: $outputPath" -ForegroundColor Yellow
-    
-} catch {
-    Write-Host ""
-    Write-Host ("=" * 60) -ForegroundColor Red
-    Write-Error "❌ AD Entitlement Review failed: $($_.Exception.Message)"
-    Write-Host "Error Details: $($_.Exception.ToString())" -ForegroundColor Red
-    exit 1
-} finally {
-    # Cleanup connections
-    if ($ldapConnection) {
-        try { 
-            $ldapConnection.Dispose() 
-        } catch { 
-            # Ignore disposal errors
-        }
-    }
-    Write-Host "Cleanup completed." -ForegroundColor Gray
+# Generate output
+Write-Host "Generating output files..." -ForegroundColor Cyan
+
+$outputPath = $config.OutputFolder
+if ($config.OutputFolder -match "^\.\.") {
+    $outputPath = Join-Path $scriptPath $config.OutputFolder
 }
+
+if (-not (Test-Path $outputPath)) {
+    New-Item -ItemType Directory -Path $outputPath -Force | Out-Null
+    Write-Host "Created output directory: $outputPath" -ForegroundColor Yellow
+}
+
+$outputFiles = @{
+    Packages1 = $config.OutputFiles.Packages1 -replace '{ReviewId}', $ReviewID
+    PackageMembers1 = $config.OutputFiles.PackageMembers1 -replace '{ReviewId}', $ReviewID
+    Packages2 = $config.OutputFiles.Packages2 -replace '{ReviewId}', $ReviewID
+    PrivilegeGroups = $config.OutputFiles.PrivilegeGroups -replace '{ReviewId}', $ReviewID
+}
+
+if ($packages1.Count -gt 0) {
+    $filePath = Join-Path $outputPath $outputFiles.Packages1
+    $packages1 | Export-Csv -Path $filePath -NoTypeInformation
+    Write-Host "  ✓ $($outputFiles.Packages1) ($($packages1.Count) records)" -ForegroundColor Green
+}
+
+if ($packageMembers1.Count -gt 0) {
+    $filePath = Join-Path $outputPath $outputFiles.PackageMembers1
+    $packageMembers1 | Export-Csv -Path $filePath -NoTypeInformation
+    Write-Host "  ✓ $($outputFiles.PackageMembers1) ($($packageMembers1.Count) records)" -ForegroundColor Green
+}
+
+if ($packages2.Count -gt 0) {
+    $filePath = Join-Path $outputPath $outputFiles.Packages2
+    $packages2 | Export-Csv -Path $filePath -NoTypeInformation
+    Write-Host "  ✓ $($outputFiles.Packages2) ($($packages2.Count) records)" -ForegroundColor Green
+}
+
+if ($privilegeGroups.Count -gt 0) {
+    $filePath = Join-Path $outputPath $outputFiles.PrivilegeGroups
+    $privilegeGroups | Export-Csv -Path $filePath -NoTypeInformation
+    Write-Host "  ✓ $($outputFiles.PrivilegeGroups) ($($privilegeGroups.Count) records)" -ForegroundColor Green
+}
+
+Write-Host ""
+Write-Host ("=" * 60) -ForegroundColor Green
+Write-Host "✓ AD Entitlement Review completed successfully!" -ForegroundColor Green
+Write-Host "Output files saved to: $outputPath" -ForegroundColor Yellow
+
+# Cleanup
+if ($ldapConnection) {
+    try {
+        $ldapConnection.Dispose()
+    }
+    catch {
+        # Ignore disposal errors
+    }
+}
+
+Write-Host "Script execution completed." -ForegroundColor Gray 
