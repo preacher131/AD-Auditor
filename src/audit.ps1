@@ -254,6 +254,51 @@ if (-not $PrivilegeOnly) {
                         }
                         
                         $packages1 += $package
+                        
+                        # Process group members for LDAP
+                        try {
+                            if ($group.Attributes["member"] -and $group.Attributes["member"].Count -gt 0) {
+                                foreach ($memberDN in $group.Attributes["member"]) {
+                                    try {
+                                        $userEntry = Invoke-LdapSearch -Ldap $ldapConnection -BaseDN $memberDN -Filter "(objectClass=user)" -Attributes @("givenName","sn","mail") | Select-Object -First 1
+                                        
+                                        if ($userEntry) {
+                                            $memberObj = New-Object PSObject
+                                            
+                                            $firstName = ""
+                                            if ($userEntry.Attributes["givenName"] -and $userEntry.Attributes["givenName"].Count -gt 0) {
+                                                $firstName = $userEntry.Attributes["givenName"][0]
+                                            }
+                                            
+                                            $lastName = ""
+                                            if ($userEntry.Attributes["sn"] -and $userEntry.Attributes["sn"].Count -gt 0) {
+                                                $lastName = $userEntry.Attributes["sn"][0]
+                                            }
+                                            
+                                            $email = ""
+                                            if ($userEntry.Attributes["mail"] -and $userEntry.Attributes["mail"].Count -gt 0) {
+                                                $email = $userEntry.Attributes["mail"][0]
+                                            }
+                                            
+                                            $memberObj | Add-Member -MemberType NoteProperty -Name "FirstName" -Value $firstName
+                                            $memberObj | Add-Member -MemberType NoteProperty -Name "LastName" -Value $lastName
+                                            $memberObj | Add-Member -MemberType NoteProperty -Name "Email" -Value $email
+                                            $memberObj | Add-Member -MemberType NoteProperty -Name "UserID" -Value (Get-SimpleObjectGuid $userEntry $true)
+                                            $memberObj | Add-Member -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
+                                            $memberObj | Add-Member -MemberType NoteProperty -Name "DerivedGroup" -Value $groupName
+                                            
+                                            $packageMembers1 += $memberObj
+                                        }
+                                    }
+                                    catch {
+                                        Write-Warning "Failed to process member: $($_.Exception.Message)"
+                                    }
+                                }
+                            }
+                        }
+                        catch {
+                            Write-Warning "Failed to process group members: $($_.Exception.Message)"
+                        }
                     }
                 }
             }
