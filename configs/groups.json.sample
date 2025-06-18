@@ -1,39 +1,22 @@
 {
   "groups": [
     {
-      "path": "OU=Groups,OU=Corporate,DC=contoso,DC=com",
-      "category": "Corporate Groups",
+      "path": "OU=Application Groups,OU=Security Groups,DC=yourdomain,DC=com",
+      "category": "Applications",
       "Logical": {
         "isLogical": true,
         "grouping": {
-          "-ro": "Read Only",
+          "-ro": "Read-Only",
           "-ch": "Change",
           "-admin": "Administrator"
         }
       }
     },
     {
-      "path": "OU=Applications,OU=Groups,DC=contoso,DC=com",
-      "category": "Application Groups",
+      "path": "OU=Department Groups,OU=Security Groups,DC=yourdomain,DC=com",
+      "category": "Departments",
       "Logical": {
-        "isLogical": true,
-        "grouping": {
-          "-ro": "Read Only",
-          "-ch": "Change",
-          "-mgr": "Manager"
-        }
-      }
-    },
-    {
-      "path": "OU=FileShares,OU=Groups,DC=contoso,DC=com",
-      "category": "File Share Groups",
-      "Logical": {
-        "isLogical": true,
-        "grouping": {
-          "-r": "Read",
-          "-rw": "Read Write",
-          "-fc": "Full Control"
-        }
+        "isLogical": false
       }
     }
   ],
@@ -57,10 +40,10 @@
       "description": "Extracts owner email when no primary/secondary distinction"
     },
     {
-      "name": "Contact Email",
-      "pattern": "Contact:\\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,})",
-      "captureGroup": 1,
-      "description": "Extracts contact email from group info field"
+      "name": "Primary Owner Name",
+      "pattern": "Primary Owner:\\s*([A-Za-z]+)\\s+([A-Za-z]+)",
+      "captureGroup": 0,
+      "description": "Extracts primary owner name for AD lookup"
     }
   ],
   "processingOptions": {
@@ -69,7 +52,8 @@
     "excludeDisabledGroups": true,
     "excludeSystemGroups": true,
     "includeMembershipSource": true,
-    "generateReviewPackageIds": true
+    "generateReviewPackageIds": true,
+    "ExemptUsers": ["template", "evp", "svc"]
   },
   "outputSettings": {
     "packages1FileName": "Packages1_{ReviewId}.csv",
@@ -77,5 +61,12 @@
     "includeEmptyGroups": false,
     "sortByGroupName": true,
     "includeGroupMetadata": true
+  },
+  "_comments": {
+    "path": "Full LDAP DN of the OU containing groups to audit - UPDATE THESE PATHS!",
+    "category": "Descriptive category for reporting",
+    "Logical.isLogical": "true if groups follow suffix naming conventions",
+    "Logical.grouping": "Map of suffixes to access level descriptions",
+    "ownerRegexPatterns": "Regex patterns to extract owner information from group descriptions"
   }
-}
+} 
