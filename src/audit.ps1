@@ -913,8 +913,8 @@ foreach ($groupConfig in $groupsConfig.groups) {
                         $primaryOwnerDisplay = $primaryOwnerEmail
                         Write-Host "  Primary owner email found: $primaryOwnerEmail" -ForegroundColor Green
                     } else {
-                        $primaryOwnerDisplay = $ownerInfo.PrimaryOwnerName
-                        Write-Host "  Primary owner email not found, using name: $($ownerInfo.PrimaryOwnerName)" -ForegroundColor Yellow
+                        $primaryOwnerDisplay = ""
+                        Write-Host "  Primary owner not found or disabled" -ForegroundColor Yellow
                     }
                 }
                 
@@ -928,8 +928,8 @@ foreach ($groupConfig in $groupsConfig.groups) {
                         $secondaryOwnerDisplay = $secondaryOwnerEmail
                         Write-Host "  Secondary owner email found: $secondaryOwnerEmail" -ForegroundColor Green
                     } else {
-                        $secondaryOwnerDisplay = $ownerInfo.SecondaryOwnerName
-                        Write-Host "  Secondary owner email not found, using name: $($ownerInfo.SecondaryOwnerName)" -ForegroundColor Yellow
+                        $secondaryOwnerDisplay = ""
+                        Write-Host "  Secondary owner not found or disabled" -ForegroundColor Yellow
                     }
                 }
                 
@@ -1066,8 +1066,8 @@ foreach ($groupConfig in $groupsConfig.groups) {
                         $primaryOwnerDisplay = $primaryOwnerEmail
                         Write-Host "  Primary owner email found: $primaryOwnerEmail" -ForegroundColor Green
                     } else {
-                        $primaryOwnerDisplay = $ownerInfo.PrimaryOwnerName
-                        Write-Host "  Primary owner email not found, using name: $($ownerInfo.PrimaryOwnerName)" -ForegroundColor Yellow
+                        $primaryOwnerDisplay = ""
+                        Write-Host "  Primary owner not found or disabled, leaving field empty" -ForegroundColor Yellow
                     }
                 }
                 
@@ -1081,8 +1081,8 @@ foreach ($groupConfig in $groupsConfig.groups) {
                         $secondaryOwnerDisplay = $secondaryOwnerEmail
                         Write-Host "  Secondary owner email found: $secondaryOwnerEmail" -ForegroundColor Green
                     } else {
-                        $secondaryOwnerDisplay = $ownerInfo.SecondaryOwnerName
-                        Write-Host "  Secondary owner email not found, using name: $($ownerInfo.SecondaryOwnerName)" -ForegroundColor Yellow
+                        $secondaryOwnerDisplay = ""
+                        Write-Host "  Secondary owner not found or disabled, leaving field empty" -ForegroundColor Yellow
                     }
                 }
                 
