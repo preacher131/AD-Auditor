@@ -25,6 +25,15 @@ Write-Host "=== AD Entitlement Review System ===" -ForegroundColor Cyan
 Write-Host "PowerShell Version: $($PSVersionTable.PSVersion)" -ForegroundColor Yellow
 Write-Host "Review ID: $ReviewID" -ForegroundColor Green
 
+# Display processing mode
+if ($PrivilegeOnly) {
+    Write-Host "Processing Mode: PRIVILEGE ONLY" -ForegroundColor Magenta
+} elseif ($GroupsOnly) {
+    Write-Host "Processing Mode: GROUPS ONLY" -ForegroundColor Magenta
+} else {
+    Write-Host "Processing Mode: FULL AUDIT (Groups + Privileges)" -ForegroundColor Magenta
+}
+
 # Import LDAP module
 try {
     $ldapModulePath = Join-Path $scriptPath "Modules\LDAP.psm1"
@@ -329,6 +338,231 @@ function Get-NestedGroupMembers {
     return $allMembers
 }
 
+# Helper function to search Active Directory for a user by name and return email
+function Get-ADUserEmailByName {
+    param(
+        [string]$FullName,
+        [hashtable]$AdParams,
+        [bool]$UseADModule = $true
+    )
+    
+    if ([string]::IsNullOrWhiteSpace($FullName)) {
+        return ""
+    }
+    
+    # Clean and parse the name
+    $cleanName = $FullName.Trim()
+    $nameParts = $cleanName -split '\s+'
+    
+    if ($nameParts.Count -eq 0) {
+        return ""
+    }
+    
+    try {
+        if ($UseADModule) {
+            Write-Host "    Searching AD for user: $cleanName" -ForegroundColor DarkGray
+            
+            # Build search filters
+            $searchFilters = @()
+            
+            if ($nameParts.Count -eq 1) {
+                # Single name - search in multiple fields
+                $singleName = $nameParts[0]
+                $searchFilters += "DisplayName -like '*$singleName*'"
+                $searchFilters += "givenName -like '*$singleName*'"
+                $searchFilters += "surname -like '*$singleName*'"
+                $searchFilters += "Name -like '*$singleName*'"
+            }
+            elseif ($nameParts.Count -eq 2) {
+                # First and Last name
+                $firstName = $nameParts[0]
+                $lastName = $nameParts[1]
+                
+                # Try exact match first
+                $searchFilters += "(givenName -eq '$firstName' -and surname -eq '$lastName')"
+                $searchFilters += "(givenName -eq '$lastName' -and surname -eq '$firstName')"  # In case they're reversed
+                
+                # Try partial matches
+                $searchFilters += "(givenName -like '*$firstName*' -and surname -like '*$lastName*')"
+                $searchFilters += "(givenName -like '*$lastName*' -and surname -like '*$firstName*')"
+                
+                # Try display name matches
+                $searchFilters += "DisplayName -like '*$firstName*$lastName*'"
+                $searchFilters += "DisplayName -like '*$lastName*$firstName*'"
+            }
+            else {
+                # Multiple names - try as display name
+                $searchFilters += "DisplayName -like '*$cleanName*'"
+                
+                # Try first and last name from the parts
+                $firstName = $nameParts[0]
+                $lastName = $nameParts[-1]  # Last element
+                $searchFilters += "(givenName -like '*$firstName*' -and surname -like '*$lastName*')"
+            }
+            
+            $allResults = @()
+            
+            # Execute searches
+            foreach ($filter in $searchFilters) {
+                try {
+                    Write-Host "      Trying filter: $filter" -ForegroundColor DarkGray
+                    $results = Get-ADUser -Filter $filter -Properties mail, givenName, surname, DisplayName, SamAccountName @AdParams
+                    
+                    if ($results) {
+                        foreach ($result in $results) {
+                            # Avoid duplicates
+                            if ($allResults | Where-Object { $_.SamAccountName -eq $result.SamAccountName }) {
+                                continue
+                            }
+                            $allResults += $result
+                        }
+                    }
+                }
+                catch {
+                    Write-Host "      Filter failed: $($_.Exception.Message)" -ForegroundColor DarkGray
+                    continue
+                }
+                
+                # If we found results with the current filter, check if we can narrow it down
+                if ($allResults.Count -gt 0) {
+                    break
+                }
+            }
+            
+            Write-Host "      Found $($allResults.Count) potential matches" -ForegroundColor DarkGray
+            
+            if ($allResults.Count -eq 0) {
+                Write-Host "      No users found for: $cleanName" -ForegroundColor Yellow
+                return ""
+            }
+            elseif ($allResults.Count -eq 1) {
+                $user = $allResults[0]
+                
+                # Check if user is enabled - if disabled or can't be found, return empty string
+                try {
+                    $userWithStatus = Get-ADUser -Identity $user.SamAccountName -Properties mail, Enabled @AdParams
+                    if (-not $userWithStatus.Enabled) {
+                        Write-Host "      User found but is disabled: $($user.DisplayName) ($($user.SamAccountName))" -ForegroundColor Yellow
+                        return ""
+                    }
+                    $email = Get-SafeValue $userWithStatus.mail
+                    Write-Host "      Found single match: $($user.DisplayName) ($($user.SamAccountName)) - Email: $email" -ForegroundColor Green
+                    return $email
+                }
+                catch {
+                    Write-Host "      User found but can't retrieve status: $($user.DisplayName) ($($user.SamAccountName))" -ForegroundColor Yellow
+                    return ""
+                }
+            }
+            else {
+                # Multiple results - try to narrow down using first name
+                Write-Host "      Multiple matches found, attempting to narrow down using first name..." -ForegroundColor Yellow
+                
+                if ($nameParts.Count -ge 1) {
+                    $firstName = $nameParts[0]
+                    $filteredResults = $allResults | Where-Object { 
+                        $_.givenName -like "*$firstName*" -or $_.DisplayName -like "*$firstName*"
+                    }
+                    
+                    if ($filteredResults.Count -eq 1) {
+                        $user = $filteredResults[0]
+                        
+                        # Check if user is enabled - if disabled or can't be found, return empty string
+                        try {
+                            $userWithStatus = Get-ADUser -Identity $user.SamAccountName -Properties mail, Enabled @AdParams
+                            if (-not $userWithStatus.Enabled) {
+                                Write-Host "      User found but is disabled: $($user.DisplayName) ($($user.SamAccountName))" -ForegroundColor Yellow
+                                return ""
+                            }
+                            $email = Get-SafeValue $userWithStatus.mail
+                            Write-Host "      Narrowed down to single match using first name: $($user.DisplayName) ($($user.SamAccountName)) - Email: $email" -ForegroundColor Green
+                            return $email
+                        }
+                        catch {
+                            Write-Host "      User found but can't retrieve status: $($user.DisplayName) ($($user.SamAccountName))" -ForegroundColor Yellow
+                            return ""
+                        }
+                    }
+                    elseif ($filteredResults.Count -gt 1) {
+                        # Still multiple matches - log them and return the first one with an email
+                        Write-Host "      Still multiple matches after first name filter:" -ForegroundColor Yellow
+                        foreach ($result in $filteredResults) {
+                            $email = Get-SafeValue $result.mail
+                            Write-Host "        - $($result.DisplayName) ($($result.SamAccountName)) - Email: $email" -ForegroundColor Yellow
+                        }
+                        
+                        # Return the first user with a non-empty email and is enabled
+                        foreach ($potentialUser in $filteredResults) {
+                            if ([string]::IsNullOrWhiteSpace($potentialUser.mail)) { continue }
+                            
+                            try {
+                                $userWithStatus = Get-ADUser -Identity $potentialUser.SamAccountName -Properties mail, Enabled @AdParams
+                                if ($userWithStatus.Enabled) {
+                                    $email = Get-SafeValue $userWithStatus.mail
+                                    Write-Host "      Using first enabled match with email: $($userWithStatus.DisplayName) - Email: $email" -ForegroundColor Cyan
+                                    return $email
+                                }
+                                else {
+                                    Write-Host "      Skipping disabled user: $($potentialUser.DisplayName) ($($potentialUser.SamAccountName))" -ForegroundColor Yellow
+                                }
+                            }
+                            catch {
+                                Write-Host "      Skipping user (can't retrieve status): $($potentialUser.DisplayName) ($($potentialUser.SamAccountName))" -ForegroundColor Yellow
+                                continue
+                            }
+                        }
+                        Write-Host "      No enabled matches have email addresses" -ForegroundColor Yellow
+                        return ""
+                    }
+                    else {
+                        # First name filter eliminated all matches - use original results
+                        Write-Host "      First name filter eliminated all matches, using original results" -ForegroundColor Yellow
+                    }
+                }
+                
+                # Log all matches and return the first one with an email
+                Write-Host "      Multiple matches found:" -ForegroundColor Yellow
+                foreach ($result in $allResults) {
+                    $email = Get-SafeValue $result.mail
+                    Write-Host "        - $($result.DisplayName) ($($result.SamAccountName)) - Email: $email" -ForegroundColor Yellow
+                }
+                
+                # Return the first user with a non-empty email and is enabled
+                foreach ($potentialUser in $allResults) {
+                    if ([string]::IsNullOrWhiteSpace($potentialUser.mail)) { continue }
+                    
+                    try {
+                        $userWithStatus = Get-ADUser -Identity $potentialUser.SamAccountName -Properties mail, Enabled @AdParams
+                        if ($userWithStatus.Enabled) {
+                            $email = Get-SafeValue $userWithStatus.mail
+                            Write-Host "      Using first enabled match with email: $($userWithStatus.DisplayName) - Email: $email" -ForegroundColor Cyan
+                            return $email
+                        }
+                        else {
+                            Write-Host "      Skipping disabled user: $($potentialUser.DisplayName) ($($potentialUser.SamAccountName))" -ForegroundColor Yellow
+                        }
+                    }
+                    catch {
+                        Write-Host "      Skipping user (can't retrieve status): $($potentialUser.DisplayName) ($($potentialUser.SamAccountName))" -ForegroundColor Yellow
+                        continue
+                    }
+                }
+                Write-Host "      No enabled matches have email addresses" -ForegroundColor Yellow
+                return ""
+            }
+        }
+        else {
+            # LDAP search would go here
+            Write-Host "      LDAP user search not yet implemented" -ForegroundColor Yellow
+            return ""
+        }
+    }
+    catch {
+        Write-Warning "Failed to search AD for user '$cleanName': $($_.Exception.Message)"
+        return ""
+    }
+}
+
 # Helper function to extract owner information using regex
 function Get-OwnerInformation {
     param(
@@ -596,8 +830,9 @@ function Get-LogicalGroupOwnerInformation {
     return $bestOwnerInfo
 }
 
-# Process groups
-Write-Host "Processing groups..." -ForegroundColor Cyan
+# Process groups (skip if PrivilegeOnly mode)
+if (-not $PrivilegeOnly) {
+    Write-Host "Processing groups..." -ForegroundColor Cyan
 
 foreach ($groupConfig in $groupsConfig.groups) {
     $ouPath = $groupConfig.path
@@ -664,18 +899,39 @@ foreach ($groupConfig in $groupsConfig.groups) {
                 # Extract owner information
                 $ownerInfo = Get-LogicalGroupOwnerInformation -LogicalGroup $logicalGroup -RegexPatterns $groupsConfig.ownerRegexPatterns
                 
-                # Format owner display (prefer names, fallback to emails)
-                $primaryOwnerDisplay = if (-not [string]::IsNullOrEmpty($ownerInfo.PrimaryOwnerName)) { 
-                    $ownerInfo.PrimaryOwnerName 
-                } elseif (-not [string]::IsNullOrEmpty($ownerInfo.PrimaryOwnerEmail)) { 
-                    $ownerInfo.PrimaryOwnerEmail 
-                } else { "" }
+                # Format owner display - lookup emails from AD if we have names
+                $primaryOwnerDisplay = ""
+                $secondaryOwnerDisplay = ""
                 
-                $secondaryOwnerDisplay = if (-not [string]::IsNullOrEmpty($ownerInfo.SecondaryOwnerName)) { 
-                    $ownerInfo.SecondaryOwnerName 
-                } elseif (-not [string]::IsNullOrEmpty($ownerInfo.SecondaryOwnerEmail)) { 
-                    $ownerInfo.SecondaryOwnerEmail 
-                } else { "" }
+                # Handle Primary Owner
+                if (-not [string]::IsNullOrEmpty($ownerInfo.PrimaryOwnerEmail)) {
+                    $primaryOwnerDisplay = $ownerInfo.PrimaryOwnerEmail
+                } elseif (-not [string]::IsNullOrEmpty($ownerInfo.PrimaryOwnerName)) {
+                    Write-Host "  Looking up primary owner: $($ownerInfo.PrimaryOwnerName)" -ForegroundColor Cyan
+                    $primaryOwnerEmail = Get-ADUserEmailByName -FullName $ownerInfo.PrimaryOwnerName -AdParams $adParams -UseADModule $useADModule
+                    if (-not [string]::IsNullOrEmpty($primaryOwnerEmail)) {
+                        $primaryOwnerDisplay = $primaryOwnerEmail
+                        Write-Host "  Primary owner email found: $primaryOwnerEmail" -ForegroundColor Green
+                    } else {
+                        $primaryOwnerDisplay = $ownerInfo.PrimaryOwnerName
+                        Write-Host "  Primary owner email not found, using name: $($ownerInfo.PrimaryOwnerName)" -ForegroundColor Yellow
+                    }
+                }
+                
+                # Handle Secondary Owner
+                if (-not [string]::IsNullOrEmpty($ownerInfo.SecondaryOwnerEmail)) {
+                    $secondaryOwnerDisplay = $ownerInfo.SecondaryOwnerEmail
+                } elseif (-not [string]::IsNullOrEmpty($ownerInfo.SecondaryOwnerName)) {
+                    Write-Host "  Looking up secondary owner: $($ownerInfo.SecondaryOwnerName)" -ForegroundColor Cyan
+                    $secondaryOwnerEmail = Get-ADUserEmailByName -FullName $ownerInfo.SecondaryOwnerName -AdParams $adParams -UseADModule $useADModule
+                    if (-not [string]::IsNullOrEmpty($secondaryOwnerEmail)) {
+                        $secondaryOwnerDisplay = $secondaryOwnerEmail
+                        Write-Host "  Secondary owner email found: $secondaryOwnerEmail" -ForegroundColor Green
+                    } else {
+                        $secondaryOwnerDisplay = $ownerInfo.SecondaryOwnerName
+                        Write-Host "  Secondary owner email not found, using name: $($ownerInfo.SecondaryOwnerName)" -ForegroundColor Yellow
+                    }
+                }
                 
                 # Combine all access levels for the logical group
                 $combinedAccessLevels = ($logicalGroup.AccessLevels | Sort-Object -Unique) -join ", "
@@ -796,18 +1052,39 @@ foreach ($groupConfig in $groupsConfig.groups) {
                 # Extract owner information
                 $ownerInfo = Get-OwnerInformation -InfoText (Get-SafeValue $group.Info) -RegexPatterns $groupsConfig.ownerRegexPatterns
                 
-                # Format owner display (prefer names, fallback to emails)
-                $primaryOwnerDisplay = if (-not [string]::IsNullOrEmpty($ownerInfo.PrimaryOwnerName)) { 
-                    $ownerInfo.PrimaryOwnerName 
-                } elseif (-not [string]::IsNullOrEmpty($ownerInfo.PrimaryOwnerEmail)) { 
-                    $ownerInfo.PrimaryOwnerEmail 
-                } else { "" }
+                # Format owner display - lookup emails from AD if we have names
+                $primaryOwnerDisplay = ""
+                $secondaryOwnerDisplay = ""
                 
-                $secondaryOwnerDisplay = if (-not [string]::IsNullOrEmpty($ownerInfo.SecondaryOwnerName)) { 
-                    $ownerInfo.SecondaryOwnerName 
-                } elseif (-not [string]::IsNullOrEmpty($ownerInfo.SecondaryOwnerEmail)) { 
-                    $ownerInfo.SecondaryOwnerEmail 
-                } else { "" }
+                # Handle Primary Owner
+                if (-not [string]::IsNullOrEmpty($ownerInfo.PrimaryOwnerEmail)) {
+                    $primaryOwnerDisplay = $ownerInfo.PrimaryOwnerEmail
+                } elseif (-not [string]::IsNullOrEmpty($ownerInfo.PrimaryOwnerName)) {
+                    Write-Host "  Looking up primary owner: $($ownerInfo.PrimaryOwnerName)" -ForegroundColor Cyan
+                    $primaryOwnerEmail = Get-ADUserEmailByName -FullName $ownerInfo.PrimaryOwnerName -AdParams $adParams -UseADModule $useADModule
+                    if (-not [string]::IsNullOrEmpty($primaryOwnerEmail)) {
+                        $primaryOwnerDisplay = $primaryOwnerEmail
+                        Write-Host "  Primary owner email found: $primaryOwnerEmail" -ForegroundColor Green
+                    } else {
+                        $primaryOwnerDisplay = $ownerInfo.PrimaryOwnerName
+                        Write-Host "  Primary owner email not found, using name: $($ownerInfo.PrimaryOwnerName)" -ForegroundColor Yellow
+                    }
+                }
+                
+                # Handle Secondary Owner
+                if (-not [string]::IsNullOrEmpty($ownerInfo.SecondaryOwnerEmail)) {
+                    $secondaryOwnerDisplay = $ownerInfo.SecondaryOwnerEmail
+                } elseif (-not [string]::IsNullOrEmpty($ownerInfo.SecondaryOwnerName)) {
+                    Write-Host "  Looking up secondary owner: $($ownerInfo.SecondaryOwnerName)" -ForegroundColor Cyan
+                    $secondaryOwnerEmail = Get-ADUserEmailByName -FullName $ownerInfo.SecondaryOwnerName -AdParams $adParams -UseADModule $useADModule
+                    if (-not [string]::IsNullOrEmpty($secondaryOwnerEmail)) {
+                        $secondaryOwnerDisplay = $secondaryOwnerEmail
+                        Write-Host "  Secondary owner email found: $secondaryOwnerEmail" -ForegroundColor Green
+                    } else {
+                        $secondaryOwnerDisplay = $ownerInfo.SecondaryOwnerName
+                        Write-Host "  Secondary owner email not found, using name: $($ownerInfo.SecondaryOwnerName)" -ForegroundColor Yellow
+                    }
+                }
                 
                 # Create package record
                 $package = New-Object PSObject
@@ -918,6 +1195,10 @@ foreach ($groupConfig in $groupsConfig.groups) {
     }
 }
 
+} else {
+    Write-Host "Skipping group processing (PrivilegeOnly mode)" -ForegroundColor Yellow
+}
+
 Write-Host "Found $($packages1.Count) groups with $($packageMembers1.Count) members" -ForegroundColor Green
 
 # Process privileges
@@ -928,16 +1209,69 @@ if (-not $GroupsOnly) {
         Write-Host "Processing OU: $ouPath" -ForegroundColor Yellow
         
         try {
+            # First test if the OU exists and is accessible
+            Write-Host "  Testing OU accessibility..." -ForegroundColor DarkGray
+            try {
+                $testOU = Get-ADOrganizationalUnit -Identity $ouPath @adParams
+                Write-Host "  OU accessible: $($testOU.Name)" -ForegroundColor Green
+            }
+            catch {
+                Write-Warning "  Cannot access OU: $($_.Exception.Message)"
+                continue
+            }
+            
             if ($useADModule) {
                 # Get all users in the OU with required attributes
-                $users = Get-ADUser -Filter * -SearchBase $ouPath -Properties sAMAccountName, displayName, mail, department, title, manager, enabled, lastLogonDate, memberOf, distinguishedName, userPrincipalName, employeeID @adParams
+                Write-Host "  Querying users from OU..." -ForegroundColor DarkGray
+                
+                # Add timeout for the AD query
+                $adJob = Start-Job -ScriptBlock {
+                    param($ouPath, $adParams)
+                    Import-Module ActiveDirectory
+                    Get-ADUser -Filter * -SearchBase $ouPath -Properties sAMAccountName, displayName, mail, department, title, manager, enabled, lastLogonDate, memberOf, distinguishedName, userPrincipalName, employeeID @adParams
+                } -ArgumentList $ouPath, $adParams
+                
+                # Wait for job with timeout (configurable)
+                $timeout = $privilegeConfig.processingOptions.queryTimeoutSeconds
+                $completed = Wait-Job -Job $adJob -Timeout $timeout
+                
+                if ($completed) {
+                    $users = Receive-Job -Job $adJob
+                    Remove-Job -Job $adJob
+                } else {
+                    Write-Warning "  AD query timed out after $timeout seconds. Stopping job..."
+                    Stop-Job -Job $adJob
+                    Remove-Job -Job $adJob
+                    Write-Warning "AD query for OU '$ouPath' timed out. This OU may be too large or there may be connectivity issues."
+                    Write-Host "  SUGGESTION: Try increasing 'queryTimeoutSeconds' in privilege.json or reduce 'maxUsersPerOU'" -ForegroundColor Yellow
+                    Write-Host "  SUGGESTION: Consider breaking large OUs into smaller sub-OUs for better performance" -ForegroundColor Yellow
+                    continue
+                }
+                
+                Write-Host "  Found $($users.Count) users to process" -ForegroundColor Green
+                
+                # Apply user limit if configured
+                $maxUsers = $privilegeConfig.processingOptions.maxUsersPerOU
+                if ($maxUsers -gt 0 -and $users.Count -gt $maxUsers) {
+                    Write-Warning "  User count ($($users.Count)) exceeds limit ($maxUsers). Processing first $maxUsers users only."
+                    $users = $users | Select-Object -First $maxUsers
+                }
+                
+                $userCount = 0
                 
                 foreach ($user in $users) {
+                    $userCount++
+                    
+                    # Progress reporting for all users when there are only 50
+                    Write-Host "    Processing user $userCount/$($users.Count): $($user.SamAccountName)" -ForegroundColor DarkGray
+                    
                     # Skip disabled users if configured
                     if (-not $privilegeConfig.processingOptions.includeDisabledUsers -and -not $user.enabled) {
+                        Write-Host "      Skipping disabled user: $($user.SamAccountName)" -ForegroundColor Yellow
                         continue
                     }
                     
+                    Write-Host "      Creating user package..." -ForegroundColor DarkGray
                     $userGuid = Get-SimpleObjectGuid $user $false
                     $reviewPackageID = New-SimpleGuid "$($user.SamAccountName)|$ReviewID|$userGuid"
                     
@@ -952,7 +1286,12 @@ if (-not $GroupsOnly) {
                     
                     # Process user's group memberships
                     if ($user.memberOf) {
+                        Write-Host "      Processing $($user.memberOf.Count) group memberships..." -ForegroundColor DarkGray
+                        $groupCount = 0
+                        
                         foreach ($groupDN in $user.memberOf) {
+                            $groupCount++
+                            Write-Host "        Group $groupCount/$($user.memberOf.Count): $groupDN" -ForegroundColor DarkGray
                             # Check if group should be excluded
                             $shouldExclude = $false
                             foreach ($excludePattern in $privilegeConfig.exclude) {
@@ -964,7 +1303,10 @@ if (-not $GroupsOnly) {
                             
                             if (-not $shouldExclude) {
                                 try {
+                                    Write-Host "          Getting group details..." -ForegroundColor DarkGray
                                     $group = Get-ADGroup -Identity $groupDN -Properties Description @adParams
+                                    Write-Host "          Group found: $($group.Name)" -ForegroundColor DarkGray
+                                    
                                     $groupGuid = Get-SimpleObjectGuid $group $false
                                     
                                     # Create privilege group record (Reverification Privilege Groups 1)
@@ -975,10 +1317,13 @@ if (-not $GroupsOnly) {
                                     $privilegeGroup | Add-Member -MemberType NoteProperty -Name "Description" -Value (Get-SafeValue $group.Description)
                                     
                                     $privilegeGroups += $privilegeGroup
+                                    Write-Host "          Added privilege group record" -ForegroundColor DarkGray
                                 }
                                 catch {
-                                    Write-Warning "Failed to get group info for $groupDN : $($_.Exception.Message)"
+                                    Write-Warning "          Failed to get group info for $groupDN : $($_.Exception.Message)"
                                 }
+                            } else {
+                                Write-Host "          Group excluded by filter" -ForegroundColor Yellow
                             }
                         }
                     }
@@ -1017,28 +1362,34 @@ $outputFiles = @{
     PrivilegeGroups = $config.OutputFiles.PrivilegeGroups -replace '{ReviewId}', $ReviewID
 }
 
-if ($packages1.Count -gt 0) {
-    $filePath = Join-Path $outputPath $outputFiles.Packages1
-    $packages1 | Export-Csv -Path $filePath -NoTypeInformation
-    Write-Host "Exported $($outputFiles.Packages1) with $($packages1.Count) records" -ForegroundColor Green
+# Export group-related files (skip if PrivilegeOnly)
+if (-not $PrivilegeOnly) {
+    if ($packages1.Count -gt 0) {
+        $filePath = Join-Path $outputPath $outputFiles.Packages1
+        $packages1 | Export-Csv -Path $filePath -NoTypeInformation
+        Write-Host "Exported $($outputFiles.Packages1) with $($packages1.Count) records" -ForegroundColor Green
+    }
+
+    if ($packageMembers1.Count -gt 0) {
+        $filePath = Join-Path $outputPath $outputFiles.PackageMembers1
+        $packageMembers1 | Export-Csv -Path $filePath -NoTypeInformation
+        Write-Host "Exported $($outputFiles.PackageMembers1) with $($packageMembers1.Count) records" -ForegroundColor Green
+    }
 }
 
-if ($packageMembers1.Count -gt 0) {
-    $filePath = Join-Path $outputPath $outputFiles.PackageMembers1
-    $packageMembers1 | Export-Csv -Path $filePath -NoTypeInformation
-    Write-Host "Exported $($outputFiles.PackageMembers1) with $($packageMembers1.Count) records" -ForegroundColor Green
-}
+# Export privilege-related files (skip if GroupsOnly)  
+if (-not $GroupsOnly) {
+    if ($packages2.Count -gt 0) {
+        $filePath = Join-Path $outputPath $outputFiles.Packages2
+        $packages2 | Export-Csv -Path $filePath -NoTypeInformation
+        Write-Host "Exported $($outputFiles.Packages2) with $($packages2.Count) records" -ForegroundColor Green
+    }
 
-if ($packages2.Count -gt 0) {
-    $filePath = Join-Path $outputPath $outputFiles.Packages2
-    $packages2 | Export-Csv -Path $filePath -NoTypeInformation
-    Write-Host "Exported $($outputFiles.Packages2) with $($packages2.Count) records" -ForegroundColor Green
-}
-
-if ($privilegeGroups.Count -gt 0) {
-    $filePath = Join-Path $outputPath $outputFiles.PrivilegeGroups
-    $privilegeGroups | Export-Csv -Path $filePath -NoTypeInformation
-    Write-Host "Exported $($outputFiles.PrivilegeGroups) with $($privilegeGroups.Count) records" -ForegroundColor Green
+    if ($privilegeGroups.Count -gt 0) {
+        $filePath = Join-Path $outputPath $outputFiles.PrivilegeGroups
+        $privilegeGroups | Export-Csv -Path $filePath -NoTypeInformation
+        Write-Host "Exported $($outputFiles.PrivilegeGroups) with $($privilegeGroups.Count) records" -ForegroundColor Green
+    }
 }
 
 Write-Host ""
