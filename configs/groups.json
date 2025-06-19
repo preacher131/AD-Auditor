@@ -46,10 +46,46 @@
       "description": "Extracts owner email when no primary/secondary distinction"
     },
     {
-      "name": "Contact Email",
-      "pattern": "Contact:\\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,})",
+      "name": "Primary Owner Name",
+      "pattern": "Primary Owner:\\s*([A-Za-z]+)\\s+([A-Za-z]+)",
+      "captureGroup": 0,
+      "description": "Extracts primary owner name for AD lookup"
+    },
+    {
+      "name": "Primary Owner Short Format",
+      "pattern": "P:\\s*([A-Za-z]+(?:\\s+[A-Za-z]+)+)",
       "captureGroup": 1,
-      "description": "Extracts contact email from group info field"
+      "description": "Extracts primary owner name from P: format"
+    },
+    {
+      "name": "Secondary Owner Short Format",
+      "pattern": "S:\\s*([A-Za-z]+(?:\\s+[A-Za-z]+)+)",
+      "captureGroup": 1,
+      "description": "Extracts secondary owner name from S: format"
+    },
+    {
+      "name": "Primary Owner Simple Format",
+      "pattern": "Primary:\\s*([A-Za-z]+(?:\\s+[A-Za-z]+)+)",
+      "captureGroup": 1,
+      "description": "Extracts primary owner name from Primary: format"
+    },
+    {
+      "name": "Secondary Owner Simple Format",
+      "pattern": "Secondary:\\s*([A-Za-z]+(?:\\s+[A-Za-z]+)+)",
+      "captureGroup": 1,
+      "description": "Extracts secondary owner name from Secondary: format"
+    },
+    {
+      "name": "Primary Owner Equals Format",
+      "pattern": "P=([A-Za-z]+(?:\\s+[A-Za-z]+)+)",
+      "captureGroup": 1,
+      "description": "Extracts primary owner name from P= format"
+    },
+    {
+      "name": "Secondary Owner Equals Format",
+      "pattern": "S=([A-Za-z]+(?:\\s+[A-Za-z]+)+)",
+      "captureGroup": 1,
+      "description": "Extracts secondary owner name from S= format"
     }
   ],
   "processingOptions": {
