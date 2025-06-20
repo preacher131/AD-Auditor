@@ -584,6 +584,52 @@ function Get-OwnerInformation {
     # Replace line breaks with spaces for some patterns, but keep original for line-based patterns
     $infoTextSingleLine = $InfoText -replace "`r`n|`r|`n", " "
     
+    # 1) Attempt extraction using externally supplied RegexPatterns (from groups.json) if provided
+    if ($RegexPatterns -and $RegexPatterns.Count -gt 0) {
+        foreach ($regexEntry in $RegexPatterns) {
+            # Ensure object has the required properties
+            if (-not ($regexEntry.PSObject.Properties["pattern"])) { continue }
+            $pattern = $regexEntry.pattern
+            $captureGroup = 1
+            if ($regexEntry.PSObject.Properties["captureGroup"]) {
+                $captureGroup = [int]$regexEntry.captureGroup
+            }
+            $name = ""
+            if ($regexEntry.PSObject.Properties["name"]) { $name = $regexEntry.name }
+
+            if ($InfoText -match $pattern) {
+                # If captureGroup is 0, use entire match; otherwise use specified group index
+                $value = if ($captureGroup -eq 0) { $Matches[0] } else { $Matches[$captureGroup] }
+                $value = $value.Trim()
+
+                switch -Regex ($name) {
+                    "Primary.*Email" {
+                        if ([string]::IsNullOrEmpty($result.PrimaryOwnerEmail)) { $result.PrimaryOwnerEmail = $value }
+                        break
+                    }
+                    "Secondary.*Email" {
+                        if ([string]::IsNullOrEmpty($result.SecondaryOwnerEmail)) { $result.SecondaryOwnerEmail = $value }
+                        break
+                    }
+                    "Owner Email Generic" {
+                        if ([string]::IsNullOrEmpty($result.PrimaryOwnerEmail)) { $result.PrimaryOwnerEmail = $value }
+                        break
+                    }
+                    "Primary.*Name" {
+                        if ([string]::IsNullOrEmpty($result.PrimaryOwnerName)) { $result.PrimaryOwnerName = $value }
+                        break
+                    }
+                    "Secondary.*Name" {
+                        if ([string]::IsNullOrEmpty($result.SecondaryOwnerName)) { $result.SecondaryOwnerName = $value }
+                        break
+                    }
+                    default { }
+                }
+            }
+        }
+    }
+    # After custom patterns, continue with built-in extraction for any missing fields
+    
     # Comprehensive regex patterns for PRIMARY owners
     $primaryEmailPatterns = @(
         "Primary Owner:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
@@ -998,18 +1044,23 @@ foreach ($groupConfig in $groupsConfig.groups) {
                                 $managerEmail = ""
                                 if ($user.Manager) {
                                     try {
-                                        $manager = Get-ADUser -Identity $user.Manager -Properties DisplayName, mail @adParams
-                                        $managerName = Get-SafeValue $manager.DisplayName
-                                        $managerEmail = Get-SafeValue $manager.mail
+                                        $manager = Get-ADUser -Identity $user.Manager -Properties DisplayName, mail, Enabled @adParams
+                                        if ($manager -and $manager.Enabled) {
+                                            $managerName = Get-SafeValue $manager.DisplayName
+                                            $managerEmail = Get-SafeValue $manager.mail
+                                        }
                                     } catch {
                                         Write-Warning "Failed to get manager info: $($_.Exception.Message)"
                                     }
                                 }
                                 
+                                # Determine FirstName value respecting Exempt status
+                                $firstNameValue = if ($isExempt) { Get-SafeValue $user.SamAccountName } else { Get-SafeValue $user.givenName }
+                                
                                 $memberObj = New-Object PSObject
-                                $memberObj | Add-Member -MemberType NoteProperty -Name "FirstName" -Value (Get-SafeValue $user.givenName)
+                                $memberObj | Add-Member -MemberType NoteProperty -Name "FirstName" -Value $firstNameValue
                                 $memberObj | Add-Member -MemberType NoteProperty -Name "LastName" -Value (Get-SafeValue $user.surname)
-                                $memberObj | Add-Member -MemberType NoteProperty -Name "Username" -Value "$((Get-SafeValue $user.givenName)) $((Get-SafeValue $user.surname))"
+                                $memberObj | Add-Member -MemberType NoteProperty -Name "Username" -Value (Get-SafeValue $user.SamAccountName)
                                 $memberObj | Add-Member -MemberType NoteProperty -Name "Email" -Value (Get-SafeValue $user.mail)
                                 $memberObj | Add-Member -MemberType NoteProperty -Name "UserID" -Value $user.ObjectGUID.ToString()
                                 $memberObj | Add-Member -MemberType NoteProperty -Name "Department" -Value (Get-SafeValue $user.Department)
@@ -1142,18 +1193,23 @@ foreach ($groupConfig in $groupsConfig.groups) {
                             $managerEmail = ""
                             if ($user.Manager) {
                                 try {
-                                    $manager = Get-ADUser -Identity $user.Manager -Properties DisplayName, mail @adParams
-                                    $managerName = Get-SafeValue $manager.DisplayName
-                                    $managerEmail = Get-SafeValue $manager.mail
+                                    $manager = Get-ADUser -Identity $user.Manager -Properties DisplayName, mail, Enabled @adParams
+                                    if ($manager -and $manager.Enabled) {
+                                        $managerName = Get-SafeValue $manager.DisplayName
+                                        $managerEmail = Get-SafeValue $manager.mail
+                                    }
                                 } catch {
                                     Write-Warning "Failed to get manager info: $($_.Exception.Message)"
                                 }
                             }
                             
+                            # Determine FirstName value respecting Exempt status
+                            $firstNameValue = if ($isExempt) { Get-SafeValue $user.SamAccountName } else { Get-SafeValue $user.givenName }
+                            
                             $memberObj = New-Object PSObject
-                            $memberObj | Add-Member -MemberType NoteProperty -Name "FirstName" -Value (Get-SafeValue $user.givenName)
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "FirstName" -Value $firstNameValue
                             $memberObj | Add-Member -MemberType NoteProperty -Name "LastName" -Value (Get-SafeValue $user.surname)
-                            $memberObj | Add-Member -MemberType NoteProperty -Name "Username" -Value "$((Get-SafeValue $user.givenName)) $((Get-SafeValue $user.surname))"
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "Username" -Value (Get-SafeValue $user.SamAccountName)
                             $memberObj | Add-Member -MemberType NoteProperty -Name "Email" -Value (Get-SafeValue $user.mail)
                             $memberObj | Add-Member -MemberType NoteProperty -Name "UserID" -Value $user.ObjectGUID.ToString()
                             $memberObj | Add-Member -MemberType NoteProperty -Name "Department" -Value (Get-SafeValue $user.Department)
