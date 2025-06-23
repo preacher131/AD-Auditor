@@ -77,10 +77,10 @@ try {
 
     if (-not (Test-Path $logFolder)) {
         New-Item -ItemType Directory -Path $logFolder -Force | Out-Null
-    }
-
+        }
+        
     $Global:AuditLogFile = Join-Path $logFolder ("AuditLog_" + $ReviewID + ".log")
-
+    
     try {
         Start-Transcript -Path $Global:AuditLogFile -Append | Out-Null
         Write-Host "Transcript logging started → $Global:AuditLogFile" -ForegroundColor Yellow
@@ -89,8 +89,8 @@ try {
     catch {
         Write-Warning "Failed to start transcript logging: $($_.Exception.Message)"
     }
-}
-catch {
+    }
+    catch {
     Write-Error "Configuration loading failed: $($_.Exception.Message)"
     exit 1
 }
@@ -127,13 +127,14 @@ try {
             Write-Host "Connected using ActiveDirectory module" -ForegroundColor Green
         }
         catch {
-            Write-Warning "ActiveDirectory module failed, using LDAP"
-            $connectionType = "LDAP"
+            Write-Warning "ActiveDirectory module failed, falling back to LDAP/LDAPS"
+            $connectionType = if ($config.Connection.UseLDAPS) { "LDAPS" } else { "LDAP" }
         }
     }
     
     if ($connectionType -eq "LDAP" -or $connectionType -eq "LDAPS") {
-        $useLDAPS = ($connectionType -eq "LDAPS")
+        # Honour explicit setting from config when present
+        $useLDAPS = if ($null -ne $config.Connection.UseLDAPS) { [bool]$config.Connection.UseLDAPS } else { ($connectionType -eq "LDAPS") }
         $ldapConnection = New-LdapConnection -Server $config.DomainController -UseLDAPS $useLDAPS -UseCurrentUser $config.Connection.UseCurrentUser -Username $config.Connection.CredentialProfile.Username -Password $config.Connection.CredentialProfile.Password -Domain $config.Connection.CredentialProfile.Domain
         $useADModule = $false
         Write-Host "Connected using $connectionType" -ForegroundColor Green
@@ -1307,6 +1308,7 @@ if (-not $GroupsOnly) {
                     $package | Add-Member -MemberType NoteProperty -Name "GroupID" -Value $userGuid
                     $package | Add-Member -MemberType NoteProperty -Name "GroupName" -Value (Get-SafeValue $user.DisplayName)
                     $package | Add-Member -MemberType NoteProperty -Name "OUPath" -Value $ouPath
+                    $package | Add-Member -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
                     
                     $packages2 += $package
                     
@@ -1432,7 +1434,7 @@ if ($ldapConnection) {
     }
 }
 
-Write-Host "Script execution completed." -ForegroundColor Gray
+Write-Host "Script execution completed." -ForegroundColor Gray 
 
 # Stop transcript if it was started
 if ($TranscriptStarted) {
