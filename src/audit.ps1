@@ -1,5 +1,4 @@
-# AD Entitlement Review Script - PowerShell 5.1 Compatible
-# Simple, clean implementation without modern syntax
+# AD Entitlement Review Script (PS5.1)
 
 [CmdletBinding()]
 param(
@@ -39,6 +38,11 @@ try {
     $ldapModulePath = Join-Path $scriptPath "Modules\LDAP.psm1"
     Import-Module $ldapModulePath -Force
     Write-Host "LDAP module loaded successfully" -ForegroundColor Green
+
+    # Import utility helpers (Get-SafeValue, New-SimpleGuid, etc.)
+    $utilsModulePath = Join-Path $scriptPath "Modules\Utils.psm1"
+    Import-Module $utilsModulePath -Force
+    Write-Host "Utils module loaded successfully" -ForegroundColor Green
 }
 catch {
     Write-Error "Failed to load LDAP module: $($_.Exception.Message)"
@@ -63,70 +67,32 @@ try {
     $privilegeContent = Get-Content $privilegeFile -Raw
     $privilegeConfig = ConvertFrom-Json $privilegeContent
     Write-Host "Privilege config loaded" -ForegroundColor Green
+
+    # Start transcript logging to file
+
+    $logFolder = $config.OutputFolder
+    if ($logFolder -match "^\.\.") {
+        $logFolder = Join-Path $scriptPath $logFolder
+    }
+
+    if (-not (Test-Path $logFolder)) {
+        New-Item -ItemType Directory -Path $logFolder -Force | Out-Null
+    }
+
+    $Global:AuditLogFile = Join-Path $logFolder ("AuditLog_" + $ReviewID + ".log")
+
+    try {
+        Start-Transcript -Path $Global:AuditLogFile -Append | Out-Null
+        Write-Host "Transcript logging started → $Global:AuditLogFile" -ForegroundColor Yellow
+        $TranscriptStarted = $true
+    }
+    catch {
+        Write-Warning "Failed to start transcript logging: $($_.Exception.Message)"
+    }
 }
 catch {
     Write-Error "Configuration loading failed: $($_.Exception.Message)"
     exit 1
-}
-
-# Helper functions
-function Get-SafeValue {
-    param($Value, $Default = "")
-    if ($Value -eq $null) { return $Default }
-    if ([string]::IsNullOrEmpty($Value)) { return $Default }
-    return $Value.ToString()
-}
-
-function New-SimpleGuid {
-    param([string]$Input)
-    
-    if ([string]::IsNullOrWhiteSpace($Input)) {
-        return [System.Guid]::NewGuid().ToString()
-    }
-    
-    try {
-        $hasher = [System.Security.Cryptography.SHA256]::Create()
-        $inputBytes = [System.Text.Encoding]::UTF8.GetBytes($Input)
-        $hashBytes = $hasher.ComputeHash($inputBytes)
-        
-        $guidBytes = New-Object byte[] 16
-        for ($i = 0; $i -lt 16; $i++) {
-            $guidBytes[$i] = $hashBytes[$i]
-        }
-        
-        $guid = New-Object System.Guid -ArgumentList $guidBytes
-        $hasher.Dispose()
-        return $guid.ToString()
-    }
-    catch {
-        return [System.Guid]::NewGuid().ToString()
-    }
-}
-
-function Get-SimpleObjectGuid {
-    param($Object, [bool]$IsLdap = $false)
-    
-    try {
-        if ($IsLdap) {
-            if ($Object.Attributes["objectGUID"] -and $Object.Attributes["objectGUID"].Count -gt 0) {
-                $guidBytes = $Object.Attributes["objectGUID"][0]
-                $guid = New-Object System.Guid -ArgumentList $guidBytes
-                return $guid.ToString()
-            }
-            if ($Object.Attributes["distinguishedName"] -and $Object.Attributes["distinguishedName"].Count -gt 0) {
-                return New-SimpleGuid $Object.Attributes["distinguishedName"][0]
-            }
-        }
-        else {
-            if ($Object.ObjectGUID) {
-                return $Object.ObjectGUID.ToString()
-            }
-        }
-        return New-SimpleGuid $Object.ToString()
-    }
-    catch {
-        return New-SimpleGuid $Object.ToString()
-    }
 }
 
 # Connection setup
@@ -178,13 +144,13 @@ catch {
     exit 1
 }
 
-# Initialize data arrays
+# Temp arrays
 $packages1 = @()           # Reverification System Packages 1
 $packageMembers1 = @()     # Reverification Package Members 1
 $packages2 = @()           # Reverification System Packages 1-2 (privilege users)
 $privilegeGroups = @()     # Reverification Privilege Groups 1
 
-# Helper function to check if a user is exempt
+# Exempt user check
 function Test-ExemptUser {
     param(
         [object]$User,
@@ -231,7 +197,7 @@ function Test-ExemptUser {
     return $false
 }
 
-# Helper function to check if a group should be excluded
+# Excluded group check
 function Test-ExcludedGroup {
     param(
         [object]$Group,
@@ -250,8 +216,12 @@ function Test-ExcludedGroup {
     
     # Check if group is a system group (if excludeSystemGroups is enabled)
     if ($ProcessingOptions.excludeSystemGroups) {
-        $systemGroupPrefixes = @("Domain ", "Enterprise ", "Schema ", "BUILTIN\\", "NT AUTHORITY\\")
-        $systemGroupNames = @("Domain Admins", "Domain Users", "Domain Guests", "Domain Controllers", "Enterprise Admins", "Schema Admins", "Authenticated Users", "Everyone")
+        # Prefix and name lists come exclusively from processingOptions
+        $systemGroupPrefixes = $ProcessingOptions.systemGroupPrefixes
+        $systemGroupNames    = $ProcessingOptions.systemGroupNames
+
+        if (-not $systemGroupPrefixes) { $systemGroupPrefixes = @() }
+        if (-not $systemGroupNames)    { $systemGroupNames    = @() }
         
         foreach ($prefix in $systemGroupPrefixes) {
             if ($Group.Name.StartsWith($prefix)) {
@@ -275,7 +245,7 @@ function Test-ExcludedGroup {
     return $false
 }
 
-# Helper function to get nested group members with depth control
+# Recursive member fetch
 function Get-NestedGroupMembers {
     param(
         [object]$Group,
@@ -338,7 +308,7 @@ function Get-NestedGroupMembers {
     return $allMembers
 }
 
-# Helper function to search Active Directory for a user by name and return email
+# Lookup user email by name
 function Get-ADUserEmailByName {
     param(
         [string]$FullName,
@@ -563,7 +533,7 @@ function Get-ADUserEmailByName {
     }
 }
 
-# Helper function to extract owner information using regex
+# Extract owner info (regex)
 function Get-OwnerInformation {
     param(
         [string]$InfoText,
@@ -758,7 +728,7 @@ function Get-OwnerInformation {
     return $result
 }
 
-# Helper function to determine logical grouping
+# Logical grouping helper
 function Get-LogicalGroupInfo {
     param(
         [string]$GroupName,
@@ -789,7 +759,7 @@ function Get-LogicalGroupInfo {
     return $result
 }
 
-# Helper function to extract the best owner information from logical groups
+# Pick best owner from logical set
 function Get-LogicalGroupOwnerInformation {
     param(
         [object]$LogicalGroup,
@@ -889,8 +859,9 @@ foreach ($groupConfig in $groupsConfig.groups) {
     
     try {
         if ($useADModule) {
-            # Get all groups in the OU
-            $allGroups = Get-ADGroup -Filter * -SearchBase $ouPath -Properties Name, Description, Info, GroupCategory, GroupScope, DistinguishedName @adParams
+            # Get groups just in this OU (no recursion) unless JSON overrides
+            $searchScope = if ($groupConfig.searchScope) { $groupConfig.searchScope } else { 'OneLevel' }
+            $allGroups = Get-ADGroup -Filter * -SearchBase $ouPath -SearchScope $searchScope -Properties Name, Description, Info, GroupCategory, GroupScope, DistinguishedName @adParams
             Write-Host "Found $($allGroups.Count) total groups in OU" -ForegroundColor Cyan
             
             # Filter groups based on processing options
@@ -1240,10 +1211,9 @@ foreach ($groupConfig in $groupsConfig.groups) {
                     Write-Warning "Failed to get group members for $($group.Name): $($_.Exception.Message)"
                 }
             }
-        }
-        else {
-            # LDAP processing would go here - similar logic but using LDAP calls
-            Write-Host "LDAP processing for new specification not yet implemented" -ForegroundColor Yellow
+        } else {
+            Write-Host "LDAP processing for group enumeration not yet implemented" -ForegroundColor Yellow
+            $allGroups = @()
         }
     }
     catch {
@@ -1462,4 +1432,9 @@ if ($ldapConnection) {
     }
 }
 
-Write-Host "Script execution completed." -ForegroundColor Gray 
+Write-Host "Script execution completed." -ForegroundColor Gray
+
+# Stop transcript if it was started
+if ($TranscriptStarted) {
+    try { Stop-Transcript | Out-Null } catch {}
+} 
