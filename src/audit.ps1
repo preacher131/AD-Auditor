@@ -15,6 +15,44 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Helper functions (defined early to be available throughout the script)
+function Update-Progress {
+    param(
+        [string]$Activity,
+        [string]$Status,
+        [int]$Current,
+        [int]$Total,
+        [string]$Id = "MainProgress"
+    )
+    
+    if (-not $NoProgress) {
+        if ($Total -gt 0) {
+            $percentComplete = [math]::Round(($Current / $Total) * 100, 1)
+            Write-Progress -Id $Id -Activity $Activity -Status "$Status ($Current of $Total)" -PercentComplete $percentComplete
+        } else {
+            Write-Progress -Id $Id -Activity $Activity -Status $Status
+        }
+    }
+}
+
+function Complete-Progress {
+    param([string]$Id = "MainProgress")
+    if (-not $NoProgress) {
+        Write-Progress -Id $Id -Completed
+    }
+}
+
+function Write-ConsoleMessage {
+    param(
+        [string]$Message,
+        [string]$ForegroundColor = "White"
+    )
+    
+    if (-not $NoProgress) {
+        Write-Host $Message -ForegroundColor $ForegroundColor
+    }
+}
+
 # Get script path
 $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
 
@@ -270,44 +308,7 @@ $packageMembers1 = @()     # Reverification Package Members 1
 $packages2 = @()           # Reverification System Packages 1-2 (privilege users)
 $privilegeGroups = @()     # Reverification Privilege Groups 1
 
-# Progress bar helper functions
-function Update-Progress {
-    param(
-        [string]$Activity,
-        [string]$Status,
-        [int]$Current,
-        [int]$Total,
-        [string]$Id = "MainProgress"
-    )
-    
-    if (-not $NoProgress) {
-        if ($Total -gt 0) {
-            $percentComplete = [math]::Round(($Current / $Total) * 100, 1)
-            Write-Progress -Id $Id -Activity $Activity -Status "$Status ($Current of $Total)" -PercentComplete $percentComplete
-        } else {
-            Write-Progress -Id $Id -Activity $Activity -Status $Status
-        }
-    }
-}
 
-function Complete-Progress {
-    param([string]$Id = "MainProgress")
-    if (-not $NoProgress) {
-        Write-Progress -Id $Id -Completed
-    }
-}
-
-# Console output helper function
-function Write-ConsoleMessage {
-    param(
-        [string]$Message,
-        [string]$ForegroundColor = "White"
-    )
-    
-    if (-not $NoProgress) {
-        Write-Host $Message -ForegroundColor $ForegroundColor
-    }
-}
 
 # Exempt user check
 function Test-ExemptUser {
