@@ -9,7 +9,8 @@ param(
     [switch]$PrivilegeOnly,
     [switch]$Skip,
     [switch]$NoProgress,
-    [string]$ConfigPath
+    [string]$ConfigPath,
+    [string]$Output
 )
 
 $ErrorActionPreference = "Stop"
@@ -72,7 +73,8 @@ try {
 
     # Start transcript logging to file
 
-    $logFolder = $config.OutputFolder
+    # Use -Output parameter if provided, otherwise use config setting
+    $logFolder = if ($Output) { $Output } else { $config.OutputFolder }
     if ($logFolder -match "^\.\.") {
         $logFolder = Join-Path $scriptPath $logFolder
     }
@@ -164,6 +166,14 @@ Write-Host "Domain Controller: $($config.DomainController)" -ForegroundColor Whi
 
 $processingModeText = if ($PrivilegeOnly) { "PRIVILEGE ONLY" } elseif ($GroupsOnly) { "GROUPS ONLY" } else { "FULL AUDIT (Groups + Privileges)" }
 Write-Host "Processing Mode: $processingModeText" -ForegroundColor White
+
+# Show output path (preview what will be used)
+$previewOutputPath = if ($Output) { $Output } else { $config.OutputFolder }
+if ($previewOutputPath -match "^\.\.") {
+    $previewOutputPath = Join-Path $scriptPath $previewOutputPath
+}
+$outputSource = if ($Output) { "Command Line Parameter" } else { "Configuration File" }
+Write-Host "Output Path: $previewOutputPath ($outputSource)" -ForegroundColor White
 Write-Host "────────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
 Write-Host ""
 
@@ -1077,7 +1087,7 @@ foreach ($groupConfig in $groupsConfig.groups) {
     $category = $groupConfig.category
     $logicalConfig = $groupConfig.Logical
     
-    Write-Host "Processing OU: $ouPath (Category: $category)" -ForegroundColor Yellow
+    Write-ConsoleMessage "Processing OU: $ouPath (Category: $category)" "Yellow"
     
     try {
         if ($useADModule) {
@@ -1664,7 +1674,7 @@ if (-not $GroupsOnly) {
     Write-ConsoleMessage "Processing privileges..." "Cyan"
     
     foreach ($ouPath in $privilegeConfig.ouPaths) {
-        Write-Host "Processing OU: $ouPath" -ForegroundColor Yellow
+        Write-ConsoleMessage "Processing OU: $ouPath" "Yellow"
         
         try {
             # First test if the OU exists and is accessible
@@ -1708,7 +1718,7 @@ if (-not $GroupsOnly) {
                     continue
                 }
                 
-                Write-Host "  Found $($users.Count) users to process" -ForegroundColor Green
+                Write-ConsoleMessage "  Found $($users.Count) users to process" "Green"
                 
                 # Apply user limit if configured
                 $maxUsers = $privilegeConfig.processingOptions.maxUsersPerOU
@@ -1801,20 +1811,21 @@ if (-not $GroupsOnly) {
         }
     }
     
-    Write-Host "Found $($packages2.Count) users with $($privilegeGroups.Count) group memberships" -ForegroundColor Green
+    Write-ConsoleMessage "Found $($packages2.Count) users with $($privilegeGroups.Count) group memberships" "Green"
 }
 
 # Generate output
 Write-ConsoleMessage "Generating output files..." "Cyan"
 
-$outputPath = $config.OutputFolder
-if ($config.OutputFolder -match "^\.\.") {
-    $outputPath = Join-Path $scriptPath $config.OutputFolder
+# Use -Output parameter if provided, otherwise use config setting
+$outputPath = if ($Output) { $Output } else { $config.OutputFolder }
+if ($outputPath -match "^\.\.") {
+    $outputPath = Join-Path $scriptPath $outputPath
 }
 
 if (-not (Test-Path $outputPath)) {
     New-Item -ItemType Directory -Path $outputPath -Force | Out-Null
-    Write-Host "Created output directory: $outputPath" -ForegroundColor Yellow
+    Write-ConsoleMessage "Created output directory: $outputPath" "Yellow"
 }
 
 $outputFiles = @{
@@ -1829,13 +1840,13 @@ if (-not $PrivilegeOnly) {
     if ($packages1.Count -gt 0) {
         $filePath = Join-Path $outputPath $outputFiles.Packages1
         $packages1 | Export-Csv -Path $filePath -NoTypeInformation
-        Write-Host "Exported $($outputFiles.Packages1) with $($packages1.Count) records" -ForegroundColor Green
+        Write-ConsoleMessage "Exported $($outputFiles.Packages1) with $($packages1.Count) records" "Green"
     }
 
     if ($packageMembers1.Count -gt 0) {
         $filePath = Join-Path $outputPath $outputFiles.PackageMembers1
         $packageMembers1 | Export-Csv -Path $filePath -NoTypeInformation
-        Write-Host "Exported $($outputFiles.PackageMembers1) with $($packageMembers1.Count) records" -ForegroundColor Green
+        Write-ConsoleMessage "Exported $($outputFiles.PackageMembers1) with $($packageMembers1.Count) records" "Green"
     }
 }
 
@@ -1844,13 +1855,13 @@ if (-not $GroupsOnly) {
     if ($packages2.Count -gt 0) {
         $filePath = Join-Path $outputPath $outputFiles.Packages2
         $packages2 | Export-Csv -Path $filePath -NoTypeInformation
-        Write-Host "Exported $($outputFiles.Packages2) with $($packages2.Count) records" -ForegroundColor Green
+        Write-ConsoleMessage "Exported $($outputFiles.Packages2) with $($packages2.Count) records" "Green"
     }
 
     if ($privilegeGroups.Count -gt 0) {
         $filePath = Join-Path $outputPath $outputFiles.PrivilegeGroups
         $privilegeGroups | Export-Csv -Path $filePath -NoTypeInformation
-        Write-Host "Exported $($outputFiles.PrivilegeGroups) with $($privilegeGroups.Count) records" -ForegroundColor Green
+        Write-ConsoleMessage "Exported $($outputFiles.PrivilegeGroups) with $($privilegeGroups.Count) records" "Green"
     }
 }
 
