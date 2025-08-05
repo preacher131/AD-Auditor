@@ -8,50 +8,12 @@ param(
     [switch]$GroupsOnly,
     [switch]$PrivilegeOnly,
     [switch]$Skip,
-    [switch]$NoProgress,
     [string]$ConfigPath,
-    [string]$Output
+    [string]$Output,
+    [string]$Name
 )
 
 $ErrorActionPreference = "Stop"
-
-# Helper functions (defined early to be available throughout the script)
-function Update-Progress {
-    param(
-        [string]$Activity,
-        [string]$Status,
-        [int]$Current,
-        [int]$Total,
-        [string]$Id = "MainProgress"
-    )
-    
-    if (-not $NoProgress) {
-        if ($Total -gt 0) {
-            $percentComplete = [math]::Round(($Current / $Total) * 100, 1)
-            Write-Progress -Id $Id -Activity $Activity -Status "$Status ($Current of $Total)" -PercentComplete $percentComplete
-        } else {
-            Write-Progress -Id $Id -Activity $Activity -Status $Status
-        }
-    }
-}
-
-function Complete-Progress {
-    param([string]$Id = "MainProgress")
-    if (-not $NoProgress) {
-        Write-Progress -Id $Id -Completed
-    }
-}
-
-function Write-ConsoleMessage {
-    param(
-        [string]$Message,
-        [string]$ForegroundColor = "White"
-    )
-    
-    if (-not $NoProgress) {
-        Write-Host $Message -ForegroundColor $ForegroundColor
-    }
-}
 
 # Get script path
 $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -61,29 +23,42 @@ if (-not $ConfigPath) {
     $ConfigPath = Join-Path $scriptPath "..\configs"
 }
 
-Write-ConsoleMessage "=== AD Entitlement Review System ===" "Cyan"
-Write-ConsoleMessage "PowerShell Version: $($PSVersionTable.PSVersion)" "Yellow"
-Write-ConsoleMessage "Review ID: $ReviewID" "Green"
+Write-Host "=== AD Entitlement Review System ===" -ForegroundColor Cyan
+Write-Host "PowerShell Version: $($PSVersionTable.PSVersion)" -ForegroundColor Yellow
+Write-Host "Review ID: $ReviewID" -ForegroundColor Green
+
+# Display output configuration
+if ($Output) {
+    Write-Host "Output Folder: $Output (custom)" -ForegroundColor Yellow
+} else {
+    Write-Host "Output Folder: Using config.json setting" -ForegroundColor Yellow
+}
+
+if ($Name) {
+    Write-Host "File Names: Using custom prefix '$Name'" -ForegroundColor Yellow
+} else {
+    Write-Host "File Names: Using config.json templates" -ForegroundColor Yellow
+}
 
 # Display processing mode
 if ($PrivilegeOnly) {
-    Write-ConsoleMessage "Processing Mode: PRIVILEGE ONLY" "Magenta"
+    Write-Host "Processing Mode: PRIVILEGE ONLY" -ForegroundColor Magenta
 } elseif ($GroupsOnly) {
-    Write-ConsoleMessage "Processing Mode: GROUPS ONLY" "Magenta"
+    Write-Host "Processing Mode: GROUPS ONLY" -ForegroundColor Magenta
 } else {
-    Write-ConsoleMessage "Processing Mode: FULL AUDIT (Groups + Privileges)" "Magenta"
+    Write-Host "Processing Mode: FULL AUDIT (Groups + Privileges)" -ForegroundColor Magenta
 }
 
 # Import LDAP module
 try {
     $ldapModulePath = Join-Path $scriptPath "Modules\LDAP.psm1"
     Import-Module $ldapModulePath -Force
-    Write-ConsoleMessage "LDAP module loaded successfully" "Green"
+    Write-Host "LDAP module loaded successfully" -ForegroundColor Green
 
     # Import utility helpers (Get-SafeValue, New-SimpleGuid, etc.)
     $utilsModulePath = Join-Path $scriptPath "Modules\Utils.psm1"
     Import-Module $utilsModulePath -Force
-    Write-ConsoleMessage "Utils module loaded successfully" "Green"
+    Write-Host "Utils module loaded successfully" -ForegroundColor Green
 }
 catch {
     Write-Error "Failed to load LDAP module: $($_.Exception.Message)"
@@ -91,28 +66,27 @@ catch {
 }
 
 # Load configurations
-Write-ConsoleMessage "Loading configurations..." "Cyan"
+Write-Host "Loading configurations..." -ForegroundColor Cyan
 
 try {
     $configFile = Join-Path $ConfigPath "config.json"
     $configContent = Get-Content $configFile -Raw
     $config = ConvertFrom-Json $configContent
-    Write-ConsoleMessage "Main config loaded" "Green"
+    Write-Host "Main config loaded" -ForegroundColor Green
     
     $groupsFile = Join-Path $ConfigPath "groups.json"
     $groupsContent = Get-Content $groupsFile -Raw
     $groupsConfig = ConvertFrom-Json $groupsContent
-    Write-ConsoleMessage "Groups config loaded" "Green"
+    Write-Host "Groups config loaded" -ForegroundColor Green
     
     $privilegeFile = Join-Path $ConfigPath "privilege.json"
     $privilegeContent = Get-Content $privilegeFile -Raw
     $privilegeConfig = ConvertFrom-Json $privilegeContent
-    Write-ConsoleMessage "Privilege config loaded" "Green"
+    Write-Host "Privilege config loaded" -ForegroundColor Green
 
     # Start transcript logging to file
 
-    # Use -Output parameter if provided, otherwise use config setting
-    $logFolder = if ($Output) { $Output } else { $config.OutputFolder }
+    $logFolder = $config.OutputFolder
     if ($logFolder -match "^\.\.") {
         $logFolder = Join-Path $scriptPath $logFolder
     }
@@ -125,7 +99,7 @@ try {
     
     try {
         Start-Transcript -Path $Global:AuditLogFile -Append | Out-Null
-        Write-ConsoleMessage "Transcript logging started → $Global:AuditLogFile" "Yellow"
+        Write-Host "Transcript logging started → $Global:AuditLogFile" -ForegroundColor Yellow
         $TranscriptStarted = $true
     }
     catch {
@@ -138,7 +112,7 @@ try {
 }
 
 # Connection setup
-Write-ConsoleMessage "Establishing connection..." "Cyan"
+Write-Host "Establishing connection..." -ForegroundColor Cyan
 
 $useADModule = $false
 $ldapConnection = $null
@@ -149,7 +123,7 @@ if ($config.Connection.Type) {
     $connectionType = $config.Connection.Type.ToUpper()
 }
 
-Write-ConsoleMessage "Connection type: $connectionType" "Yellow"
+Write-Host "Connection type: $connectionType" -ForegroundColor Yellow
 
 try {
     if ($connectionType -eq "ACTIVEDIRECTORY") {
@@ -166,7 +140,7 @@ try {
             
             $null = Get-ADDomain @adParams
             $useADModule = $true
-            Write-ConsoleMessage "Connected using ActiveDirectory module" "Green"
+            Write-Host "Connected using ActiveDirectory module" -ForegroundColor Green
         }
         catch {
             Write-Warning "ActiveDirectory module failed, falling back to LDAP/LDAPS"
@@ -179,7 +153,7 @@ try {
         $useLDAPS = if ($null -ne $config.Connection.UseLDAPS) { [bool]$config.Connection.UseLDAPS } else { ($connectionType -eq "LDAPS") }
         $ldapConnection = New-LdapConnection -Server $config.DomainController -UseLDAPS $useLDAPS -UseCurrentUser $config.Connection.UseCurrentUser -Username $config.Connection.CredentialProfile.Username -Password $config.Connection.CredentialProfile.Password -Domain $config.Connection.CredentialProfile.Domain
         $useADModule = $false
-        Write-ConsoleMessage "Connected using $connectionType" "Green"
+        Write-Host "Connected using $connectionType" -ForegroundColor Green
     }
 }
 catch {
@@ -188,14 +162,11 @@ catch {
 }
 
 # Display configuration summary and get user confirmation
-if (-not $NoProgress) {
-    Write-Host ""
-    Write-Host "=== CONFIGURATION SUMMARY ===" -ForegroundColor Cyan
-    Write-Host ""
-}
+Write-Host ""
+Write-Host "=== CONFIGURATION SUMMARY ===" -ForegroundColor Cyan
+Write-Host ""
 
 # Display general configuration
-if (-not $NoProgress) {
 Write-Host "GENERAL CONFIGURATION:" -ForegroundColor Yellow
 Write-Host "────────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
 Write-Host "Review ID: $ReviewID" -ForegroundColor White
@@ -204,14 +175,6 @@ Write-Host "Domain Controller: $($config.DomainController)" -ForegroundColor Whi
 
 $processingModeText = if ($PrivilegeOnly) { "PRIVILEGE ONLY" } elseif ($GroupsOnly) { "GROUPS ONLY" } else { "FULL AUDIT (Groups + Privileges)" }
 Write-Host "Processing Mode: $processingModeText" -ForegroundColor White
-
-# Show output path (preview what will be used)
-$previewOutputPath = if ($Output) { $Output } else { $config.OutputFolder }
-if ($previewOutputPath -match "^\.\.") {
-    $previewOutputPath = Join-Path $scriptPath $previewOutputPath
-}
-$outputSource = if ($Output) { "Command Line Parameter" } else { "Configuration File" }
-Write-Host "Output Path: $previewOutputPath ($outputSource)" -ForegroundColor White
 Write-Host "────────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
 Write-Host ""
 
@@ -278,15 +241,10 @@ if (-not $GroupsOnly) {
 }
 
 Write-Host ""
-}
 
-# Confirmation prompt (skip if -Skip flag or -NoProgress is used)
-if ($Skip -or $NoProgress) {
-    if ($Skip) {
-        Write-ConsoleMessage "Confirmation prompt skipped (using -Skip flag)" "Cyan"
-    } else {
-        Write-ConsoleMessage "Confirmation prompt skipped (using -NoProgress flag)" "Cyan"
-    }
+# Confirmation prompt (skip if -Skip flag is used)
+if ($Skip) {
+    Write-Host "Confirmation prompt skipped (using -Skip flag)" -ForegroundColor Cyan
 } else {
     do {
         $confirmation = Read-Host "Do you want to continue with this configuration? (y/n)"
@@ -299,16 +257,14 @@ if ($Skip -or $NoProgress) {
     } while ($confirmation -ne 'y' -and $confirmation -ne 'yes')
 }
 
-Write-ConsoleMessage "Starting audit execution..." "Green"
-if (-not $NoProgress) { Write-Host "" }
+Write-Host "Starting audit execution..." -ForegroundColor Green
+Write-Host ""
 
 # Temp arrays
 $packages1 = @()           # Reverification System Packages 1
 $packageMembers1 = @()     # Reverification Package Members 1
 $packages2 = @()           # Reverification System Packages 1-2 (privilege users)
 $privilegeGroups = @()     # Reverification Privilege Groups 1
-
-
 
 # Exempt user check
 function Test-ExemptUser {
@@ -1081,14 +1037,21 @@ function Get-LogicalGroupOwnerInformation {
 
 # Process groups (skip if PrivilegeOnly mode)
 if (-not $PrivilegeOnly) {
-    Write-ConsoleMessage "Processing groups..." "Cyan"
+    Write-Host "Processing groups..." -ForegroundColor Cyan
+
+$totalGroupConfigs = $groupsConfig.groups.Count
+$currentGroupConfigIndex = 0
 
 foreach ($groupConfig in $groupsConfig.groups) {
+    $currentGroupConfigIndex++
     $ouPath = $groupConfig.path
     $category = $groupConfig.category
     $logicalConfig = $groupConfig.Logical
     
-    Write-ConsoleMessage "Processing OU: $ouPath (Category: $category)" "Yellow"
+    # Progress bar for group OU processing
+    Write-Progress -Activity "Processing Group OUs" -Status "Processing OU: $ouPath (Category: $category)" -PercentComplete (($currentGroupConfigIndex / $totalGroupConfigs) * 100) -Id 1
+    
+    Write-Host "Processing OU: $ouPath (Category: $category)" -ForegroundColor Yellow
     
     try {
         if ($useADModule) {
@@ -1140,12 +1103,17 @@ foreach ($groupConfig in $groupsConfig.groups) {
             }
             
             # Process logical groups
-            $logicalGroupIndex = 0
-            $logicalGroupNames = @($logicalGroups.Keys)
-            foreach ($logicalGroupName in $logicalGroupNames) {
-                $logicalGroupIndex++
-                Update-Progress -Activity "Processing Logical Groups in OU: $ouPath" -Status "Group: $logicalGroupName ($logicalGroupIndex of $($logicalGroupNames.Count))" -Current $logicalGroupIndex -Total $logicalGroupNames.Count -Id "LogicalGroups"
+            $totalLogicalGroups = $logicalGroups.Keys.Count
+            $totalStandaloneGroups = $standaloneGroups.Count
+            $totalGroupsInOU = $totalLogicalGroups + $totalStandaloneGroups
+            $currentLogicalGroupIndex = 0
+            
+            foreach ($logicalGroupName in $logicalGroups.Keys) {
+                $currentLogicalGroupIndex++
                 $logicalGroup = $logicalGroups[$logicalGroupName]
+                
+                # Progress bar for logical group processing
+                Write-Progress -Activity "Processing Groups in OU" -Status "Processing logical group: $($logicalGroup.BaseName)" -PercentComplete (($currentLogicalGroupIndex / $totalGroupsInOU) * 100) -Id 2 -ParentId 1
                 
                 # ============================================
                 # Immutable flag & access-order handling
@@ -1232,10 +1200,7 @@ foreach ($groupConfig in $groupsConfig.groups) {
                 $packages1 += $package
                 
                 # Process members from all subgroups
-                $subGroupIndex = 0
                 foreach ($subGroupInfo in $logicalGroup.Groups) {
-                    $subGroupIndex++
-                    Update-Progress -Activity "Processing Subgroups in Logical Group: $($logicalGroup.BaseName)" -Status "Subgroup: $($subGroupInfo.Group.Name) ($subGroupIndex of $($logicalGroup.Groups.Count))" -Current $subGroupIndex -Total $logicalGroup.Groups.Count -Id "Subgroups"
                     $subGroup = $subGroupInfo.Group
                     $logicalAccess = $subGroupInfo.LogicalAccess
                     
@@ -1272,12 +1237,7 @@ foreach ($groupConfig in $groupsConfig.groups) {
                         if (-not $logicalGroup.ContainsKey('MemberTracker')) { $logicalGroup['MemberTracker'] = @{} }
                         $memberTracker = $logicalGroup['MemberTracker']
                         
-                        $memberIndex = 0
                         foreach ($memberInfo in $allMembers) {
-                            $memberIndex++
-                            if ($allMembers.Count -gt 10) {  # Only show progress for groups with more than 10 members
-                                Update-Progress -Activity "Processing Members in Subgroup: $($subGroup.Name)" -Status "Member: $($memberInfo.User.sAMAccountName) ($memberIndex of $($allMembers.Count))" -Current $memberIndex -Total $allMembers.Count -Id "Members"
-                            }
                             # Validate member info and user object
                             if (-not $memberInfo -or -not $memberInfo.User) {
                                 Write-Warning "Invalid member info object, skipping"
@@ -1417,22 +1377,16 @@ foreach ($groupConfig in $groupsConfig.groups) {
                     catch {
                         Write-Warning "Failed to get group members for $($subGroup.Name): $($_.Exception.Message)"
                     }
-                    # Complete member progress for this subgroup
-                    if ($allMembers.Count -gt 10) {
-                        Complete-Progress -Id "Members"
-                    }
                 }
-                # Complete subgroup progress for this logical group
-                Complete-Progress -Id "Subgroups"
             }
             
-            Complete-Progress -Id "LogicalGroups"
-            
             # Process standalone (non-logical) groups
-            $standaloneGroupIndex = 0
             foreach ($group in $standaloneGroups) {
-                $standaloneGroupIndex++
-                Update-Progress -Activity "Processing Standalone Groups in OU: $ouPath" -Status "Group: $($group.Name) ($standaloneGroupIndex of $($standaloneGroups.Count))" -Current $standaloneGroupIndex -Total $standaloneGroups.Count -Id "StandaloneGroups"
+                $currentLogicalGroupIndex++
+                
+                # Progress bar for individual group processing
+                Write-Progress -Activity "Processing Groups in OU" -Status "Processing group: $($group.Name)" -PercentComplete (($currentLogicalGroupIndex / $totalGroupsInOU) * 100) -Id 2 -ParentId 1
+                
                 Write-Host "Processing standalone group: $($group.Name)" -ForegroundColor Gray
                 
                 $groupGuid = Get-SimpleObjectGuid $group $false
@@ -1525,12 +1479,7 @@ foreach ($groupConfig in $groupsConfig.groups) {
                     # Track members to avoid duplicates
                     $memberTracker = @{}
                     
-                    $memberIndex = 0
                     foreach ($memberInfo in $allMembers) {
-                        $memberIndex++
-                        if ($allMembers.Count -gt 10) {  # Only show progress for groups with more than 10 members
-                            Update-Progress -Activity "Processing Members in Standalone Group: $($group.Name)" -Status "Member: $($memberInfo.User.sAMAccountName) ($memberIndex of $($allMembers.Count))" -Current $memberIndex -Total $allMembers.Count -Id "StandaloneMembers"
-                        }
                         # Validate member info and user object
                         if (-not $memberInfo -or -not $memberInfo.User) {
                             Write-Warning "Invalid member info object, skipping"
@@ -1648,12 +1597,7 @@ foreach ($groupConfig in $groupsConfig.groups) {
                 catch {
                     Write-Warning "Failed to get group members for $($group.Name): $($_.Exception.Message)"
                 }
-                # Complete member progress for this standalone group
-                if ($allMembers.Count -gt 10) {
-                    Complete-Progress -Id "StandaloneMembers"
-                }
             }
-            Complete-Progress -Id "StandaloneGroups"
         } else {
             Write-Host "LDAP processing for group enumeration not yet implemented" -ForegroundColor Yellow
             $allGroups = @()
@@ -1662,20 +1606,34 @@ foreach ($groupConfig in $groupsConfig.groups) {
     catch {
         Write-Warning "Failed to process OU: $($_.Exception.Message)"
     }
+    
+    # Clear the child progress bar when OU processing is complete
+    Write-Progress -Activity "Processing Groups in OU" -Completed -Id 2
 }
+
+# Clear the main progress bar when all group processing is complete
+Write-Progress -Activity "Processing Group OUs" -Completed -Id 1
 
 } else {
-    Write-ConsoleMessage "Skipping group processing (PrivilegeOnly mode)" "Yellow"
+    Write-Host "Skipping group processing (PrivilegeOnly mode)" -ForegroundColor Yellow
 }
 
-Write-ConsoleMessage "Found $($packages1.Count) groups with $($packageMembers1.Count) members" "Green"
+Write-Host "Found $($packages1.Count) groups with $($packageMembers1.Count) members" -ForegroundColor Green
 
 # Process privileges
 if (-not $GroupsOnly) {
-    Write-ConsoleMessage "Processing privileges..." "Cyan"
+    Write-Host "Processing privileges..." -ForegroundColor Cyan
+    
+    $totalPrivilegeOUs = $privilegeConfig.ouPaths.Count
+    $currentPrivilegeOUIndex = 0
     
     foreach ($ouPath in $privilegeConfig.ouPaths) {
-        Write-ConsoleMessage "Processing OU: $ouPath" "Yellow"
+        $currentPrivilegeOUIndex++
+        
+        # Progress bar for privilege OU processing
+        Write-Progress -Activity "Processing Privilege OUs" -Status "Processing OU: $ouPath" -PercentComplete (($currentPrivilegeOUIndex / $totalPrivilegeOUs) * 100) -Id 1
+        
+        Write-Host "Processing OU: $ouPath" -ForegroundColor Yellow
         
         try {
             # First test if the OU exists and is accessible
@@ -1719,7 +1677,7 @@ if (-not $GroupsOnly) {
                     continue
                 }
                 
-                Write-ConsoleMessage "  Found $($users.Count) users to process" "Green"
+                Write-Host "  Found $($users.Count) users to process" -ForegroundColor Green
                 
                 # Apply user limit if configured
                 $maxUsers = $privilegeConfig.processingOptions.maxUsersPerOU
@@ -1732,6 +1690,9 @@ if (-not $GroupsOnly) {
                 
                 foreach ($user in $users) {
                     $userCount++
+                    
+                    # Progress bar for user processing
+                    Write-Progress -Activity "Processing Users in OU" -Status "Processing user: $($user.SamAccountName)" -PercentComplete (($userCount / $users.Count) * 100) -Id 2 -ParentId 1
                     
                     # Progress reporting for all users when there are only 50
                     Write-Host "    Processing user $userCount/$($users.Count): $($user.SamAccountName)" -ForegroundColor DarkGray
@@ -1810,30 +1771,54 @@ if (-not $GroupsOnly) {
         catch {
             Write-Warning "Failed to process privilege OU: $($_.Exception.Message)"
         }
+        
+        # Clear the child progress bar when OU processing is complete
+        Write-Progress -Activity "Processing Users in OU" -Completed -Id 2
     }
     
-    Write-ConsoleMessage "Found $($packages2.Count) users with $($privilegeGroups.Count) group memberships" "Green"
+    # Clear the main progress bar when all privilege processing is complete
+    Write-Progress -Activity "Processing Privilege OUs" -Completed -Id 1
+    
+    Write-Host "Found $($packages2.Count) users with $($privilegeGroups.Count) group memberships" -ForegroundColor Green
 }
 
 # Generate output
-Write-ConsoleMessage "Generating output files..." "Cyan"
+Write-Host "Generating output files..." -ForegroundColor Cyan
 
-# Use -Output parameter if provided, otherwise use config setting
-$outputPath = if ($Output) { $Output } else { $config.OutputFolder }
-if ($outputPath -match "^\.\.") {
-    $outputPath = Join-Path $scriptPath $outputPath
+# Use -Output parameter if provided, otherwise use config.json OutputFolder
+if ($Output) {
+    $outputPath = $Output
+    # Handle relative paths
+    if ($Output -match "^\.\.") {
+        $outputPath = Join-Path $scriptPath $Output
+    }
+} else {
+    $outputPath = $config.OutputFolder
+    if ($config.OutputFolder -match "^\.\.") {
+        $outputPath = Join-Path $scriptPath $config.OutputFolder
+    }
 }
 
 if (-not (Test-Path $outputPath)) {
     New-Item -ItemType Directory -Path $outputPath -Force | Out-Null
-    Write-ConsoleMessage "Created output directory: $outputPath" "Yellow"
+    Write-Host "Created output directory: $outputPath" -ForegroundColor Yellow
 }
 
-$outputFiles = @{
-    Packages1 = $config.OutputFiles.Packages1 -replace '{ReviewId}', $ReviewID
-    PackageMembers1 = $config.OutputFiles.PackageMembers1 -replace '{ReviewId}', $ReviewID
-    Packages2 = $config.OutputFiles.Packages2 -replace '{ReviewId}', $ReviewID
-    PrivilegeGroups = $config.OutputFiles.PrivilegeGroups -replace '{ReviewId}', $ReviewID
+# Use -Name parameter if provided, otherwise use config.json OutputFiles
+if ($Name) {
+    $outputFiles = @{
+        Packages1 = "${Name}_Packages1.csv"
+        PackageMembers1 = "${Name}_PackageMembers1.csv"
+        Packages2 = "${Name}_Packages2.csv"
+        PrivilegeGroups = "${Name}_PrivilegeGroups.csv"
+    }
+} else {
+    $outputFiles = @{
+        Packages1 = $config.OutputFiles.Packages1 -replace '{ReviewId}', $ReviewID
+        PackageMembers1 = $config.OutputFiles.PackageMembers1 -replace '{ReviewId}', $ReviewID
+        Packages2 = $config.OutputFiles.Packages2 -replace '{ReviewId}', $ReviewID
+        PrivilegeGroups = $config.OutputFiles.PrivilegeGroups -replace '{ReviewId}', $ReviewID
+    }
 }
 
 # Export group-related files (skip if PrivilegeOnly)
@@ -1841,13 +1826,13 @@ if (-not $PrivilegeOnly) {
     if ($packages1.Count -gt 0) {
         $filePath = Join-Path $outputPath $outputFiles.Packages1
         $packages1 | Export-Csv -Path $filePath -NoTypeInformation
-        Write-ConsoleMessage "Exported $($outputFiles.Packages1) with $($packages1.Count) records" "Green"
+        Write-Host "Exported $($outputFiles.Packages1) with $($packages1.Count) records" -ForegroundColor Green
     }
 
     if ($packageMembers1.Count -gt 0) {
         $filePath = Join-Path $outputPath $outputFiles.PackageMembers1
         $packageMembers1 | Export-Csv -Path $filePath -NoTypeInformation
-        Write-ConsoleMessage "Exported $($outputFiles.PackageMembers1) with $($packageMembers1.Count) records" "Green"
+        Write-Host "Exported $($outputFiles.PackageMembers1) with $($packageMembers1.Count) records" -ForegroundColor Green
     }
 }
 
@@ -1856,19 +1841,19 @@ if (-not $GroupsOnly) {
     if ($packages2.Count -gt 0) {
         $filePath = Join-Path $outputPath $outputFiles.Packages2
         $packages2 | Export-Csv -Path $filePath -NoTypeInformation
-        Write-ConsoleMessage "Exported $($outputFiles.Packages2) with $($packages2.Count) records" "Green"
+        Write-Host "Exported $($outputFiles.Packages2) with $($packages2.Count) records" -ForegroundColor Green
     }
 
     if ($privilegeGroups.Count -gt 0) {
         $filePath = Join-Path $outputPath $outputFiles.PrivilegeGroups
         $privilegeGroups | Export-Csv -Path $filePath -NoTypeInformation
-        Write-ConsoleMessage "Exported $($outputFiles.PrivilegeGroups) with $($privilegeGroups.Count) records" "Green"
+        Write-Host "Exported $($outputFiles.PrivilegeGroups) with $($privilegeGroups.Count) records" -ForegroundColor Green
     }
 }
 
-if (-not $NoProgress) { Write-Host "" }
-Write-ConsoleMessage "AD Entitlement Review completed successfully!" "Green"
-Write-ConsoleMessage "Output files saved to: $outputPath" "Yellow"
+Write-Host ""
+Write-Host "AD Entitlement Review completed successfully!" -ForegroundColor Green
+Write-Host "Output files saved to: $outputPath" -ForegroundColor Yellow
 
 # Cleanup
 if ($ldapConnection) {
@@ -1880,7 +1865,7 @@ if ($ldapConnection) {
     }
 }
 
-Write-ConsoleMessage "Script execution completed." "Gray" 
+Write-Host "Script execution completed." -ForegroundColor Gray 
 
 # Stop transcript if it was started
 if ($TranscriptStarted) {
