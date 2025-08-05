@@ -1039,17 +1039,10 @@ function Get-LogicalGroupOwnerInformation {
 if (-not $PrivilegeOnly) {
     Write-Host "Processing groups..." -ForegroundColor Cyan
 
-$totalGroupConfigs = $groupsConfig.groups.Count
-$currentGroupConfigIndex = 0
-
 foreach ($groupConfig in $groupsConfig.groups) {
-    $currentGroupConfigIndex++
     $ouPath = $groupConfig.path
     $category = $groupConfig.category
     $logicalConfig = $groupConfig.Logical
-    
-    # Progress bar for group OU processing
-    Write-Progress -Activity "Processing Group OUs" -Status "Processing OU: $ouPath (Category: $category)" -PercentComplete (($currentGroupConfigIndex / $totalGroupConfigs) * 100) -Id 1
     
     Write-Host "Processing OU: $ouPath (Category: $category)" -ForegroundColor Yellow
     
@@ -1106,14 +1099,14 @@ foreach ($groupConfig in $groupsConfig.groups) {
             $totalLogicalGroups = $logicalGroups.Keys.Count
             $totalStandaloneGroups = $standaloneGroups.Count
             $totalGroupsInOU = $totalLogicalGroups + $totalStandaloneGroups
-            $currentLogicalGroupIndex = 0
+            $currentGroupIndex = 0
             
             foreach ($logicalGroupName in $logicalGroups.Keys) {
-                $currentLogicalGroupIndex++
+                $currentGroupIndex++
                 $logicalGroup = $logicalGroups[$logicalGroupName]
                 
-                # Progress bar for logical group processing
-                Write-Progress -Activity "Processing Groups in OU" -Status "Processing logical group: $($logicalGroup.BaseName)" -PercentComplete (($currentLogicalGroupIndex / $totalGroupsInOU) * 100) -Id 2 -ParentId 1
+                # Progress bar for group processing (main progress bar)
+                Write-Progress -Activity "Processing Groups in OU" -Status "Processing logical group: $($logicalGroup.BaseName)" -PercentComplete (($currentGroupIndex / $totalGroupsInOU) * 100) -Id 1
                 
                 # ============================================
                 # Immutable flag & access-order handling
@@ -1237,7 +1230,12 @@ foreach ($groupConfig in $groupsConfig.groups) {
                         if (-not $logicalGroup.ContainsKey('MemberTracker')) { $logicalGroup['MemberTracker'] = @{} }
                         $memberTracker = $logicalGroup['MemberTracker']
                         
+                        $memberCount = 0
                         foreach ($memberInfo in $allMembers) {
+                            $memberCount++
+                            
+                            # Progress bar for member processing (secondary progress bar)
+                            Write-Progress -Activity "Processing Members in Group" -Status "Processing member $memberCount of $($allMembers.Count)" -PercentComplete (($memberCount / $allMembers.Count) * 100) -Id 2 -ParentId 1
                             # Validate member info and user object
                             if (-not $memberInfo -or -not $memberInfo.User) {
                                 Write-Warning "Invalid member info object, skipping"
@@ -1382,10 +1380,10 @@ foreach ($groupConfig in $groupsConfig.groups) {
             
             # Process standalone (non-logical) groups
             foreach ($group in $standaloneGroups) {
-                $currentLogicalGroupIndex++
+                $currentGroupIndex++
                 
-                # Progress bar for individual group processing
-                Write-Progress -Activity "Processing Groups in OU" -Status "Processing group: $($group.Name)" -PercentComplete (($currentLogicalGroupIndex / $totalGroupsInOU) * 100) -Id 2 -ParentId 1
+                # Progress bar for group processing (main progress bar)
+                Write-Progress -Activity "Processing Groups in OU" -Status "Processing group: $($group.Name)" -PercentComplete (($currentGroupIndex / $totalGroupsInOU) * 100) -Id 1
                 
                 Write-Host "Processing standalone group: $($group.Name)" -ForegroundColor Gray
                 
@@ -1479,7 +1477,12 @@ foreach ($groupConfig in $groupsConfig.groups) {
                     # Track members to avoid duplicates
                     $memberTracker = @{}
                     
+                    $memberCount = 0
                     foreach ($memberInfo in $allMembers) {
+                        $memberCount++
+                        
+                        # Progress bar for member processing (secondary progress bar)
+                        Write-Progress -Activity "Processing Members in Group" -Status "Processing member $memberCount of $($allMembers.Count)" -PercentComplete (($memberCount / $allMembers.Count) * 100) -Id 2 -ParentId 1
                         # Validate member info and user object
                         if (-not $memberInfo -or -not $memberInfo.User) {
                             Write-Warning "Invalid member info object, skipping"
@@ -1607,12 +1610,10 @@ foreach ($groupConfig in $groupsConfig.groups) {
         Write-Warning "Failed to process OU: $($_.Exception.Message)"
     }
     
-    # Clear the child progress bar when OU processing is complete
-    Write-Progress -Activity "Processing Groups in OU" -Completed -Id 2
+    # Clear progress bars when OU processing is complete
+    Write-Progress -Activity "Processing Members in Group" -Completed -Id 2
+    Write-Progress -Activity "Processing Groups in OU" -Completed -Id 1
 }
-
-# Clear the main progress bar when all group processing is complete
-Write-Progress -Activity "Processing Group OUs" -Completed -Id 1
 
 } else {
     Write-Host "Skipping group processing (PrivilegeOnly mode)" -ForegroundColor Yellow
@@ -1624,15 +1625,7 @@ Write-Host "Found $($packages1.Count) groups with $($packageMembers1.Count) memb
 if (-not $GroupsOnly) {
     Write-Host "Processing privileges..." -ForegroundColor Cyan
     
-    $totalPrivilegeOUs = $privilegeConfig.ouPaths.Count
-    $currentPrivilegeOUIndex = 0
-    
     foreach ($ouPath in $privilegeConfig.ouPaths) {
-        $currentPrivilegeOUIndex++
-        
-        # Progress bar for privilege OU processing
-        Write-Progress -Activity "Processing Privilege OUs" -Status "Processing OU: $ouPath" -PercentComplete (($currentPrivilegeOUIndex / $totalPrivilegeOUs) * 100) -Id 1
-        
         Write-Host "Processing OU: $ouPath" -ForegroundColor Yellow
         
         try {
@@ -1691,8 +1684,8 @@ if (-not $GroupsOnly) {
                 foreach ($user in $users) {
                     $userCount++
                     
-                    # Progress bar for user processing
-                    Write-Progress -Activity "Processing Users in OU" -Status "Processing user: $($user.SamAccountName)" -PercentComplete (($userCount / $users.Count) * 100) -Id 2 -ParentId 1
+                    # Progress bar for user processing (main progress bar)
+                    Write-Progress -Activity "Processing Users in OU" -Status "Processing user: $($user.SamAccountName)" -PercentComplete (($userCount / $users.Count) * 100) -Id 1
                     
                     # Progress reporting for all users when there are only 50
                     Write-Host "    Processing user $userCount/$($users.Count): $($user.SamAccountName)" -ForegroundColor DarkGray
@@ -1724,6 +1717,10 @@ if (-not $GroupsOnly) {
                         
                         foreach ($groupDN in $user.memberOf) {
                             $groupCount++
+                            
+                            # Progress bar for group membership processing (secondary progress bar)
+                            Write-Progress -Activity "Processing Group Memberships" -Status "Processing group membership $groupCount of $($user.memberOf.Count)" -PercentComplete (($groupCount / $user.memberOf.Count) * 100) -Id 2 -ParentId 1
+                            
                             Write-Host "        Group $groupCount/$($user.memberOf.Count): $groupDN" -ForegroundColor DarkGray
                             # Check if group should be excluded
                             $shouldExclude = $false
@@ -1772,12 +1769,10 @@ if (-not $GroupsOnly) {
             Write-Warning "Failed to process privilege OU: $($_.Exception.Message)"
         }
         
-        # Clear the child progress bar when OU processing is complete
-        Write-Progress -Activity "Processing Users in OU" -Completed -Id 2
+        # Clear progress bars when OU processing is complete
+        Write-Progress -Activity "Processing Group Memberships" -Completed -Id 2
+        Write-Progress -Activity "Processing Users in OU" -Completed -Id 1
     }
-    
-    # Clear the main progress bar when all privilege processing is complete
-    Write-Progress -Activity "Processing Privilege OUs" -Completed -Id 1
     
     Write-Host "Found $($packages2.Count) users with $($privilegeGroups.Count) group memberships" -ForegroundColor Green
 }
