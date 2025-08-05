@@ -7,6 +7,7 @@ param(
     
     [switch]$GroupsOnly,
     [switch]$PrivilegeOnly,
+    [switch]$Skip,
     [string]$ConfigPath
 )
 
@@ -145,6 +146,105 @@ catch {
     exit 1
 }
 
+# Display configuration summary and get user confirmation
+Write-Host ""
+Write-Host "=== CONFIGURATION SUMMARY ===" -ForegroundColor Cyan
+Write-Host ""
+
+# Display general configuration
+Write-Host "GENERAL CONFIGURATION:" -ForegroundColor Yellow
+Write-Host "────────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+Write-Host "Review ID: $ReviewID" -ForegroundColor White
+Write-Host "Connection Type: $connectionType" -ForegroundColor White
+Write-Host "Domain Controller: $($config.DomainController)" -ForegroundColor White
+
+$processingModeText = if ($PrivilegeOnly) { "PRIVILEGE ONLY" } elseif ($GroupsOnly) { "GROUPS ONLY" } else { "FULL AUDIT (Groups + Privileges)" }
+Write-Host "Processing Mode: $processingModeText" -ForegroundColor White
+Write-Host "────────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+Write-Host ""
+
+# Display groups configuration
+if (-not $PrivilegeOnly) {
+    Write-Host "GROUPS CONFIGURATION:" -ForegroundColor Yellow
+    Write-Host "────────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+    
+    foreach ($groupConfig in $groupsConfig.groups) {
+        Write-Host ""
+        Write-Host "OU Path: $($groupConfig.path)" -ForegroundColor White
+        Write-Host "Category: $($groupConfig.category)" -ForegroundColor White
+        
+        $logicalConfig = $groupConfig.Logical
+        if ($logicalConfig.isLogical) {
+            Write-Host "Logical Grouping: YES" -ForegroundColor Green
+            Write-Host "Immutable: $($logicalConfig.Immutable)" -ForegroundColor $(if ($logicalConfig.Immutable) { "Green" } else { "Yellow" })
+            
+            if ($logicalConfig.Supercede -and -not $logicalConfig.Immutable) {
+                Write-Host "Supercede Access: $($logicalConfig.Supercede)" -ForegroundColor Cyan
+            } elseif ($logicalConfig.Immutable) {
+                Write-Host "Supercede Access: IGNORED (Immutable=true)" -ForegroundColor DarkGray
+            }
+            
+            Write-Host ""
+            Write-Host "Logical Access Mappings:" -ForegroundColor Cyan
+            Write-Host "┌─────────────────┬─────────────────────┐" -ForegroundColor DarkGray
+            Write-Host "│ Suffix          │ Access Level        │" -ForegroundColor DarkGray
+            Write-Host "├─────────────────┼─────────────────────┤" -ForegroundColor DarkGray
+            
+            foreach ($suffix in $logicalConfig.grouping.PSObject.Properties.Name | Sort-Object) {
+                $accessLevel = $logicalConfig.grouping.$suffix
+                $suffixPadded = $suffix.PadRight(15)
+                $accessPadded = $accessLevel.PadRight(19)
+                Write-Host "│ $suffixPadded │ $accessPadded │" -ForegroundColor White
+            }
+            Write-Host "└─────────────────┴─────────────────────┘" -ForegroundColor DarkGray
+        } else {
+            Write-Host "Logical Grouping: NO" -ForegroundColor Yellow
+            Write-Host "Immutable: N/A" -ForegroundColor DarkGray
+        }
+        
+        Write-Host "────────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+    }
+}
+
+# Display privilege configuration
+if (-not $GroupsOnly) {
+    Write-Host ""
+    Write-Host "PRIVILEGE CONFIGURATION:" -ForegroundColor Yellow
+    Write-Host "────────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+    
+    foreach ($ouPath in $privilegeConfig.ouPaths) {
+        Write-Host "OU Path: $ouPath" -ForegroundColor White
+    }
+    
+    Write-Host ""
+    Write-Host "Processing Options:" -ForegroundColor Cyan
+    Write-Host "• Include Disabled Users: $($privilegeConfig.processingOptions.includeDisabledUsers)" -ForegroundColor White
+    Write-Host "• Max Users Per OU: $($privilegeConfig.processingOptions.maxUsersPerOU)" -ForegroundColor White
+    Write-Host "• Query Timeout: $($privilegeConfig.processingOptions.queryTimeoutSeconds) seconds" -ForegroundColor White
+    
+    Write-Host "────────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+}
+
+Write-Host ""
+
+# Confirmation prompt (skip if -Skip flag is used)
+if ($Skip) {
+    Write-Host "Confirmation prompt skipped (using -Skip flag)" -ForegroundColor Cyan
+} else {
+    do {
+        $confirmation = Read-Host "Do you want to continue with this configuration? (y/n)"
+        $confirmation = $confirmation.ToLower().Trim()
+        
+        if ($confirmation -eq 'n' -or $confirmation -eq 'no') {
+            Write-Host "Script execution cancelled by user." -ForegroundColor Yellow
+            exit 0
+        }
+    } while ($confirmation -ne 'y' -and $confirmation -ne 'yes')
+}
+
+Write-Host "Starting audit execution..." -ForegroundColor Green
+Write-Host ""
+
 # Temp arrays
 $packages1 = @()           # Reverification System Packages 1
 $packageMembers1 = @()     # Reverification Package Members 1
@@ -196,6 +296,73 @@ function Test-ExemptUser {
     }
     
     return $false
+}
+
+# Helper function to get group members that works for both security and distribution groups
+function Get-GroupMembers {
+    param(
+        [object]$Group,
+        [hashtable]$AdParams
+    )
+    
+    $members = @()
+    
+    # Check if this is a security group
+    if ($Group.GroupCategory -eq "Security") {
+        Write-Host "      Processing security group: $($Group.Name)" -ForegroundColor DarkGray
+        try {
+            $directMembers = Get-ADGroupMember -Identity $Group @AdParams
+            if ($null -ne $directMembers) {
+                $members = $directMembers
+                Write-Host "      Found $($members.Count) members in security group" -ForegroundColor DarkGray
+            } else {
+                Write-Host "      No members found in security group" -ForegroundColor DarkGray
+            }
+        }
+        catch {
+            Write-Warning "Failed to get members for security group '$($Group.Name)': $($_.Exception.Message)"
+        }
+    }
+    else {
+        # For distribution groups, we need to use a different approach
+        Write-Host "      Processing distribution group: $($Group.Name)" -ForegroundColor DarkGray
+        # Get the group with member attribute
+        try {
+            $groupWithMembers = Get-ADGroup -Identity $Group.DistinguishedName -Properties members @AdParams
+            if ($groupWithMembers.members) {
+                Write-Host "      Found $($groupWithMembers.members.Count) member DNs in distribution group" -ForegroundColor DarkGray
+                foreach ($memberDN in $groupWithMembers.members) {
+                    try {
+                        # First get basic object info to determine type
+                        $member = Get-ADObject -Identity $memberDN -Properties objectClass, sAMAccountName @AdParams
+                        if ($member -and $member.objectClass -eq "user" -and $member.sAMAccountName) {
+                            # For users, get full user object using SamAccountName
+                            try {
+                                $userObject = Get-ADUser -Identity $member.sAMAccountName -Properties mail, givenName, surname, SamAccountName, Department, Title, Manager, Description @AdParams
+                                if ($userObject) {
+                                    $members += $userObject
+                                }
+                            }
+                            catch {
+                                Write-Warning "Failed to get user object for SamAccountName '$($member.sAMAccountName)': $($_.Exception.Message)"
+                            }
+                        }
+                    }
+                    catch {
+                        Write-Warning "Failed to get member object for '$memberDN': $($_.Exception.Message)"
+                    }
+                }
+                Write-Host "      Successfully processed $($members.Count) members from distribution group" -ForegroundColor DarkGray
+            } else {
+                Write-Host "      No members found in distribution group" -ForegroundColor DarkGray
+            }
+        }
+        catch {
+            Write-Warning "Failed to get members for distribution group '$($Group.Name)': $($_.Exception.Message)"
+        }
+    }
+    
+    return $members
 }
 
 # Excluded group check
@@ -271,7 +438,13 @@ function Get-NestedGroupMembers {
     $allMembers = @()
     
     try {
-        $directMembers = Get-ADGroupMember -Identity $Group @AdParams
+        $directMembers = Get-GroupMembers -Group $Group -AdParams $AdParams
+        
+        # Handle null result from Get-GroupMembers
+        if ($null -eq $directMembers -or $directMembers.Count -eq 0) {
+            Write-Host "    No members found for group: $($Group.Name)" -ForegroundColor DarkGray
+            return @()
+        }
         
         foreach ($member in $directMembers) {
             if ($member.objectClass -eq "user") {
@@ -862,8 +1035,12 @@ foreach ($groupConfig in $groupsConfig.groups) {
         if ($useADModule) {
             # Get groups just in this OU (no recursion) unless JSON overrides
             $searchScope = if ($groupConfig.searchScope) { $groupConfig.searchScope } else { 'OneLevel' }
-            $allGroups = Get-ADGroup -Filter * -SearchBase $ouPath -SearchScope $searchScope -Properties Name, Description, Info, GroupCategory, GroupScope, DistinguishedName @adParams
+            $allGroups = Get-ADGroup -Filter * -SearchBase $ouPath -SearchScope $searchScope -Properties Name, Description, Info, GroupCategory, GroupScope, DistinguishedName, whenCreated @adParams
             Write-Host "Found $($allGroups.Count) total groups in OU" -ForegroundColor Cyan
+            
+            # Log group types for debugging
+            $groupTypes = $allGroups | Group-Object GroupCategory | ForEach-Object { "$($_.Name): $($_.Count)" }
+            Write-Host "Group types found: $($groupTypes -join ', ')" -ForegroundColor DarkGray
             
             # Filter groups based on processing options
             $groups = @()
@@ -906,6 +1083,24 @@ foreach ($groupConfig in $groupsConfig.groups) {
             # Process logical groups
             foreach ($logicalGroupName in $logicalGroups.Keys) {
                 $logicalGroup = $logicalGroups[$logicalGroupName]
+                
+                # ============================================
+                # Immutable flag & access-order handling
+                # ============================================
+                $immutableFlag = $false
+                if ($null -ne $logicalConfig -and ($logicalConfig.PSObject.Properties.Name -contains 'Immutable')) {
+                    $immutableFlag = [bool]$logicalConfig.Immutable
+                }
+                
+                # Build an ordered list of access levels from the grouping map so we can
+                # later maintain consistent ordering when we have to merge multiple
+                # access values for the same user (Immutable scenario)
+                $accessOrder = @()
+                if ($null -ne $logicalConfig -and $logicalConfig.grouping) {
+                    foreach ($suffix in $logicalConfig.grouping.PSObject.Properties.Name) {
+                        $accessOrder += $logicalConfig.grouping.$suffix
+                    }
+                }
                 
                 Write-Host "Processing logical group: $($logicalGroup.BaseName) with $($logicalGroup.Groups.Count) subgroups" -ForegroundColor Yellow
                 
@@ -965,8 +1160,11 @@ foreach ($groupConfig in $groupsConfig.groups) {
                 $package | Add-Member -MemberType NoteProperty -Name "OUPath" -Value $ouPath
                 $package | Add-Member -MemberType NoteProperty -Name "Tag" -Value $category
                 $package | Add-Member -MemberType NoteProperty -Name "Description" -Value (Get-SafeValue $primaryGroup.Description)
+                $package | Add-Member -MemberType NoteProperty -Name "DateCreated" -Value (Get-SafeValue $primaryGroup.whenCreated)
                 $package | Add-Member -MemberType NoteProperty -Name "LogicalGrouping" -Value $true
                 $package | Add-Member -MemberType NoteProperty -Name "LogicalAccess" -Value $combinedAccessLevels
+                # New column indicating whether Immutable logic was applied
+                $package | Add-Member -MemberType NoteProperty -Name "Immutable" -Value $immutableFlag
                 
                 $packages1 += $package
                 
@@ -986,76 +1184,162 @@ foreach ($groupConfig in $groupsConfig.groups) {
                             $allMembers = Get-NestedGroupMembers -Group $subGroup -AdParams $adParams -MaxDepth $groupsConfig.processingOptions.maxRecursionDepth
                         } else {
                             # Get only direct members
-                            $directMembers = Get-ADGroupMember -Identity $subGroup @adParams
-                            foreach ($member in $directMembers) {
-                                if ($member.objectClass -eq "user") {
-                                    $memberInfo = @{
-                                        User = $member
-                                        SourceGroup = $subGroup.Name
-                                        MembershipPath = $subGroup.Name
-                                        Depth = 0
+                            $directMembers = Get-GroupMembers -Group $subGroup -AdParams $adParams
+                            if ($null -ne $directMembers -and $directMembers.Count -gt 0) {
+                                foreach ($member in $directMembers) {
+                                    if ($member.objectClass -eq "user") {
+                                        $memberInfo = @{
+                                            User = $member
+                                            SourceGroup = $subGroup.Name
+                                            MembershipPath = $subGroup.Name
+                                            Depth = 0
+                                        }
+                                        $allMembers += $memberInfo
                                     }
-                                    $allMembers += $memberInfo
                                 }
                             }
                         }
                         
                         Write-Host "Found $($allMembers.Count) total members in subgroup $($subGroup.Name)" -ForegroundColor DarkGray
                         
+                        # Track members to respect supersede rules
+                        if (-not $logicalGroup.ContainsKey('MemberTracker')) { $logicalGroup['MemberTracker'] = @{} }
+                        $memberTracker = $logicalGroup['MemberTracker']
+                        
                         foreach ($memberInfo in $allMembers) {
+                            # Validate member info and user object
+                            if (-not $memberInfo -or -not $memberInfo.User) {
+                                Write-Warning "Invalid member info object, skipping"
+                                continue
+                            }
+                            
+                            # Check if user object has required properties
+                            if (-not $memberInfo.User.sAMAccountName -and -not $memberInfo.User.distinguishedName) {
+                                Write-Warning "User object missing both SamAccountName and distinguishedName, skipping"
+                                continue
+                            }
+                            
+                            # Supersede access value (e.g. "Change") if provided in config
+                            $supersedeAccess = ($logicalConfig.Supercede) -replace "^\s+|\s+$", "" -replace "\s+", " "
+                            $supersedeAccess = $supersedeAccess.ToLower()
+
+                            # If Immutable is enabled we deliberately ignore any Supersede
+                            # logic – every distinct permission should be retained.
+                            if ($immutableFlag) {
+                                $supersedeAccess = ""
+                            }
+
+                            $normalizedAccess = ($logicalAccess -replace "^\s+|\s+$", "" -replace "\s+", " ").ToLower()
+                            
+                            # Always fetch complete user object using SamAccountName for consistency
+                            $user = $null
+                            $userIdentity = $null
+                            
+                            # Determine the best identifier to use
+                            if ($memberInfo.User.sAMAccountName) {
+                                $userIdentity = $memberInfo.User.sAMAccountName
+                                Write-Host "        Fetching user by SamAccountName: $userIdentity" -ForegroundColor DarkGray
+                            } elseif ($memberInfo.User.distinguishedName) {
+                                $userIdentity = $memberInfo.User.distinguishedName
+                                Write-Host "        Fetching user by DistinguishedName: $userIdentity" -ForegroundColor DarkGray
+                            } else {
+                                Write-Warning "User object missing both SamAccountName and DistinguishedName"
+                                continue
+                            }
+                            
                             try {
-                                $user = Get-ADUser -Identity $memberInfo.User.distinguishedName -Properties mail, givenName, surname, SamAccountName, Department, Title, Manager, Description @adParams
-                                
-                                Write-Host "Processing user: $($user.SamAccountName) with access: $logicalAccess" -ForegroundColor DarkGray
-                                
-                                # Check if user is exempt
-                                $isExempt = Test-ExemptUser -User $user -ExemptTerms $groupsConfig.processingOptions.ExemptUsers
-                                
-                                # Get manager information
-                                $managerName = ""
-                                $managerEmail = ""
-                                if ($user.Manager) {
-                                    try {
-                                        $manager = Get-ADUser -Identity $user.Manager -Properties DisplayName, mail, Enabled @adParams
-                                        if ($manager -and $manager.Enabled) {
-                                            $managerName = Get-SafeValue $manager.DisplayName
-                                            $managerEmail = Get-SafeValue $manager.mail
-                                        }
-                                    } catch {
-                                        Write-Warning "Failed to get manager info: $($_.Exception.Message)"
-                                    }
-                                }
-                                
-                                # Determine FirstName value respecting Exempt status
-                                $firstNameValue = if ($isExempt) { Get-SafeValue $user.SamAccountName } else { Get-SafeValue $user.givenName }
-                                
-                                $memberObj = New-Object PSObject
-                                $memberObj | Add-Member -MemberType NoteProperty -Name "FirstName" -Value $firstNameValue
-                                $memberObj | Add-Member -MemberType NoteProperty -Name "LastName" -Value (Get-SafeValue $user.surname)
-                                $memberObj | Add-Member -MemberType NoteProperty -Name "Username" -Value (Get-SafeValue $user.SamAccountName)
-                                $memberObj | Add-Member -MemberType NoteProperty -Name "Email" -Value (Get-SafeValue $user.mail)
-                                $memberObj | Add-Member -MemberType NoteProperty -Name "UserID" -Value $user.ObjectGUID.ToString()
-                                $memberObj | Add-Member -MemberType NoteProperty -Name "Department" -Value (Get-SafeValue $user.Department)
-                                $memberObj | Add-Member -MemberType NoteProperty -Name "JobTitle" -Value (Get-SafeValue $user.Title)
-                                $memberObj | Add-Member -MemberType NoteProperty -Name "ManagerName" -Value $managerName
-                                $memberObj | Add-Member -MemberType NoteProperty -Name "ManagerEmail" -Value $managerEmail
-                                $memberObj | Add-Member -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
-                                
-                                # Add membership source info if enabled
-                                if ($groupsConfig.processingOptions.includeMembershipSource) {
-                                    $memberObj | Add-Member -MemberType NoteProperty -Name "DerivedGroup" -Value $memberInfo.SourceGroup
-                                    $memberObj | Add-Member -MemberType NoteProperty -Name "MembershipPath" -Value $memberInfo.MembershipPath
-                                } else {
-                                    $memberObj | Add-Member -MemberType NoteProperty -Name "DerivedGroup" -Value (if ($memberInfo.Depth -eq 0) { "" } else { $memberInfo.SourceGroup })
-                                }
-                                
-                                $memberObj | Add-Member -MemberType NoteProperty -Name "LogicalAccess" -Value $logicalAccess
-                                $memberObj | Add-Member -MemberType NoteProperty -Name "Exempt" -Value $isExempt
-                                
-                                $packageMembers1 += $memberObj
+                                # Always get fresh user object with ALL properties
+                                $user = Get-ADUser -Identity $userIdentity -Properties mail, givenName, surname, SamAccountName, Department, Title, Manager, Description, DisplayName, EmployeeID, Company, Office, OfficePhone, MobilePhone, Enabled @adParams
                             }
                             catch {
-                                Write-Warning "Failed to process user: $($_.Exception.Message)"
+                                Write-Warning "Failed to fetch AD user '$userIdentity': $($_.Exception.Message)"
+                                continue
+                            }
+
+                            # Skip if user lookup failed
+                            if (-not $user) { continue }
+
+                            $isExempt = Test-ExemptUser -User $user -ExemptTerms $groupsConfig.processingOptions.ExemptUsers
+
+                            # Get manager info
+                            $managerName = ""
+                            $managerEmail = ""
+                            if ($user.Manager) {
+                                try {
+                                    $manager = Get-ADUser -Identity $user.Manager -Properties DisplayName, mail, Enabled @adParams
+                                    if ($manager -and $manager.Enabled) {
+                                        $managerName = Get-SafeValue $manager.DisplayName
+                                        $managerEmail = Get-SafeValue $manager.mail
+                                    }
+                                } catch {}
+                            }
+
+                            $firstNameValue = if ($isExempt) { Get-SafeValue $user.SamAccountName } else { Get-SafeValue $user.givenName }
+
+                            $memberObj = New-Object PSObject
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "FirstName" -Value $firstNameValue
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "LastName" -Value (Get-SafeValue $user.surname)
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "Username" -Value (Get-SafeValue $user.SamAccountName)
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "Email" -Value (Get-SafeValue $user.mail)
+                            $userID = if ($user.ObjectGUID) { $user.ObjectGUID.ToString() } else { "" }
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "UserID" -Value $userID
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "Department" -Value (Get-SafeValue $user.Department)
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "JobTitle" -Value (Get-SafeValue $user.Title)
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "DisplayName" -Value (Get-SafeValue $user.DisplayName)
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "Company" -Value (Get-SafeValue $user.Company)
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "Office" -Value (Get-SafeValue $user.Office)
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "OfficePhone" -Value (Get-SafeValue $user.OfficePhone)
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "MobilePhone" -Value (Get-SafeValue $user.MobilePhone)
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "EmployeeID" -Value (Get-SafeValue $user.EmployeeID)
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "Enabled" -Value $user.Enabled
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "ManagerName" -Value $managerName
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "ManagerEmail" -Value $managerEmail
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
+                            
+                            # Add membership source info if enabled
+                            if ($groupsConfig.processingOptions.includeMembershipSource) {
+                                $memberObj | Add-Member -MemberType NoteProperty -Name "DerivedGroup" -Value $memberInfo.SourceGroup
+                                $memberObj | Add-Member -MemberType NoteProperty -Name "MembershipPath" -Value $memberInfo.MembershipPath
+                            } else {
+                                $derivedGroup = if ($memberInfo.Depth -eq 0) { "" } else { $memberInfo.SourceGroup }
+                                $memberObj | Add-Member -MemberType NoteProperty -Name "DerivedGroup" -Value $derivedGroup
+                            }
+                            
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "LogicalAccess" -Value $logicalAccess
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "Exempt" -Value $isExempt
+                            
+                            $memberKey = "$($reviewPackageID)|$($user.SamAccountName)"
+
+                            if ($memberTracker.ContainsKey($memberKey)) {
+                                $existingObj = $memberTracker[$memberKey]
+
+                                if ($immutableFlag) {
+                                    # Merge LogicalAccess values in alphabetical order
+                                    $existingAccesses = @()
+                                    if (-not [string]::IsNullOrWhiteSpace($existingObj.LogicalAccess)) {
+                                        $existingAccesses = $existingObj.LogicalAccess -split "\s*,\s*"
+                                    }
+
+                                    if (-not ($existingAccesses -contains $logicalAccess)) {
+                                        $combinedAccesses = $existingAccesses + $logicalAccess
+                                        # Sort alphabetically and join with ", "
+                                        $sortedAccesses = $combinedAccesses | Sort-Object
+                                        $existingObj.LogicalAccess = $sortedAccesses -join ", "
+                                    }
+                                    # Do NOT add another record to $packageMembers1 when immutable – we just updated the existing object.
+                                }
+                                elseif ($supersedeAccess -and ($normalizedAccess -eq $supersedeAccess)) {
+                                    # Replace existing (lower priority) entry
+                                    $packageMembers1.Remove($existingObj) | Out-Null
+                                    $memberTracker[$memberKey] = $memberObj
+                                    $packageMembers1 += $memberObj
+                                } else {
+                                    # Skip duplicate
+                                    Write-Host "Skipping duplicate user $($memberInfo.User.SamAccountName) (already recorded)" -ForegroundColor DarkGray
+                                }
+                            } else {
+                                $memberTracker[$memberKey] = $memberObj
+                                $packageMembers1 += $memberObj
                             }
                         }
                     }
@@ -1120,8 +1404,11 @@ foreach ($groupConfig in $groupsConfig.groups) {
                 $package | Add-Member -MemberType NoteProperty -Name "OUPath" -Value $ouPath
                 $package | Add-Member -MemberType NoteProperty -Name "Tag" -Value $category
                 $package | Add-Member -MemberType NoteProperty -Name "Description" -Value (Get-SafeValue $group.Description)
+                $package | Add-Member -MemberType NoteProperty -Name "DateCreated" -Value (Get-SafeValue $group.whenCreated)
                 $package | Add-Member -MemberType NoteProperty -Name "LogicalGrouping" -Value $false
                 $package | Add-Member -MemberType NoteProperty -Name "LogicalAccess" -Value ""
+                # Stand-alone groups are never immutable
+                $package | Add-Member -MemberType NoteProperty -Name "Immutable" -Value $false
                 
                 $packages1 += $package
                 
@@ -1135,27 +1422,70 @@ foreach ($groupConfig in $groupsConfig.groups) {
                         $allMembers = Get-NestedGroupMembers -Group $group -AdParams $adParams -MaxDepth $groupsConfig.processingOptions.maxRecursionDepth
                     } else {
                         # Get only direct members
-                        $directMembers = Get-ADGroupMember -Identity $group @adParams
-                        foreach ($member in $directMembers) {
-                            if ($member.objectClass -eq "user") {
-                                $memberInfo = @{
-                                    User = $member
-                                    SourceGroup = $group.Name
-                                    MembershipPath = $group.Name
-                                    Depth = 0
+                        $directMembers = Get-GroupMembers -Group $group -AdParams $adParams
+                        if ($null -ne $directMembers -and $directMembers.Count -gt 0) {
+                            foreach ($member in $directMembers) {
+                                if ($member.objectClass -eq "user") {
+                                    $memberInfo = @{
+                                        User = $member
+                                        SourceGroup = $group.Name
+                                        MembershipPath = $group.Name
+                                        Depth = 0
+                                    }
+                                    $allMembers += $memberInfo
                                 }
-                                $allMembers += $memberInfo
                             }
                         }
                     }
                     
                     Write-Host "Found $($allMembers.Count) total members in standalone group $($group.Name)" -ForegroundColor DarkGray
                     
+                    # Track members to avoid duplicates
+                    $memberTracker = @{}
+                    
                     foreach ($memberInfo in $allMembers) {
+                        # Validate member info and user object
+                        if (-not $memberInfo -or -not $memberInfo.User) {
+                            Write-Warning "Invalid member info object, skipping"
+                            continue
+                        }
+                        
+                        # Check if user object has required properties
+                        if (-not $memberInfo.User.sAMAccountName -and -not $memberInfo.User.distinguishedName) {
+                            Write-Warning "User object missing both SamAccountName and distinguishedName, skipping"
+                            continue
+                        }
+                        
                         try {
-                            $user = Get-ADUser -Identity $memberInfo.User.distinguishedName -Properties mail, givenName, surname, SamAccountName, Department, Title, Manager, Description @adParams
+                            # Always fetch complete user object using SamAccountName for consistency
+                            $user = $null
+                            $userIdentity = $null
+                            
+                            # Determine the best identifier to use
+                            if ($memberInfo.User.sAMAccountName) {
+                                $userIdentity = $memberInfo.User.sAMAccountName
+                                Write-Host "        Fetching user by SamAccountName: $userIdentity" -ForegroundColor DarkGray
+                            } elseif ($memberInfo.User.distinguishedName) {
+                                $userIdentity = $memberInfo.User.distinguishedName
+                                Write-Host "        Fetching user by DistinguishedName: $userIdentity" -ForegroundColor DarkGray
+                            } else {
+                                Write-Warning "User object missing both SamAccountName and DistinguishedName"
+                                continue
+                            }
+                            
+                            try {
+                                # Always get fresh user object with ALL properties
+                                $user = Get-ADUser -Identity $userIdentity -Properties mail, givenName, surname, SamAccountName, Department, Title, Manager, Description, DisplayName, EmployeeID, Company, Office, OfficePhone, MobilePhone, Enabled @adParams
+                            }
+                            catch {
+                                Write-Warning "Failed to fetch AD user '$userIdentity': $($_.Exception.Message)"
+                                continue
+                            }
                             
                             Write-Host "Processing user: $($user.SamAccountName)" -ForegroundColor DarkGray
+                            
+                            # Skip if user lookup failed
+                            if (-not $user) { continue }
                             
                             # Check if user is exempt
                             $isExempt = Test-ExemptUser -User $user -ExemptTerms $groupsConfig.processingOptions.ExemptUsers
@@ -1183,9 +1513,17 @@ foreach ($groupConfig in $groupsConfig.groups) {
                             $memberObj | Add-Member -MemberType NoteProperty -Name "LastName" -Value (Get-SafeValue $user.surname)
                             $memberObj | Add-Member -MemberType NoteProperty -Name "Username" -Value (Get-SafeValue $user.SamAccountName)
                             $memberObj | Add-Member -MemberType NoteProperty -Name "Email" -Value (Get-SafeValue $user.mail)
-                            $memberObj | Add-Member -MemberType NoteProperty -Name "UserID" -Value $user.ObjectGUID.ToString()
+                            $userID = if ($user.ObjectGUID) { $user.ObjectGUID.ToString() } else { "" }
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "UserID" -Value $userID
                             $memberObj | Add-Member -MemberType NoteProperty -Name "Department" -Value (Get-SafeValue $user.Department)
                             $memberObj | Add-Member -MemberType NoteProperty -Name "JobTitle" -Value (Get-SafeValue $user.Title)
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "DisplayName" -Value (Get-SafeValue $user.DisplayName)
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "Company" -Value (Get-SafeValue $user.Company)
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "Office" -Value (Get-SafeValue $user.Office)
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "OfficePhone" -Value (Get-SafeValue $user.OfficePhone)
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "MobilePhone" -Value (Get-SafeValue $user.MobilePhone)
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "EmployeeID" -Value (Get-SafeValue $user.EmployeeID)
+                            $memberObj | Add-Member -MemberType NoteProperty -Name "Enabled" -Value $user.Enabled
                             $memberObj | Add-Member -MemberType NoteProperty -Name "ManagerName" -Value $managerName
                             $memberObj | Add-Member -MemberType NoteProperty -Name "ManagerEmail" -Value $managerEmail
                             $memberObj | Add-Member -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
@@ -1195,16 +1533,28 @@ foreach ($groupConfig in $groupsConfig.groups) {
                                 $memberObj | Add-Member -MemberType NoteProperty -Name "DerivedGroup" -Value $memberInfo.SourceGroup
                                 $memberObj | Add-Member -MemberType NoteProperty -Name "MembershipPath" -Value $memberInfo.MembershipPath
                             } else {
-                                $memberObj | Add-Member -MemberType NoteProperty -Name "DerivedGroup" -Value (if ($memberInfo.Depth -eq 0) { "" } else { $memberInfo.SourceGroup })
+                                $derivedGroup = if ($memberInfo.Depth -eq 0) { "" } else { $memberInfo.SourceGroup }
+                                $memberObj | Add-Member -MemberType NoteProperty -Name "DerivedGroup" -Value $derivedGroup
                             }
                             
                             $memberObj | Add-Member -MemberType NoteProperty -Name "LogicalAccess" -Value ""
                             $memberObj | Add-Member -MemberType NoteProperty -Name "Exempt" -Value $isExempt
                             
-                            $packageMembers1 += $memberObj
+                            $memberKey = "$($reviewPackageID)|$($user.SamAccountName)"
+
+                            if ($memberTracker.ContainsKey($memberKey)) {
+                                # Skip duplicate
+                                Write-Host "Skipping duplicate user $($user.SamAccountName) (already recorded)" -ForegroundColor DarkGray
+                            } else {
+                                $memberTracker[$memberKey] = $memberObj
+                                $packageMembers1 += $memberObj
+                            }
                         }
                         catch {
                             Write-Warning "Failed to process user: $($_.Exception.Message)"
+                            if ($memberInfo -and $memberInfo.User) {
+                                Write-Warning "  User object properties: DistinguishedName=$($memberInfo.User.distinguishedName), ObjectClass=$($memberInfo.User.objectClass), SamAccountName=$($memberInfo.User.sAMAccountName)"
+                            }
                         }
                     }
                 }
@@ -1252,11 +1602,13 @@ if (-not $GroupsOnly) {
                 Write-Host "  Querying users from OU..." -ForegroundColor DarkGray
                 
                 # Add timeout for the AD query
+                $userSearchScope = if ($privilegeConfig.processingOptions.userSearchScope) { $privilegeConfig.processingOptions.userSearchScope } else { 'OneLevel' }
+
                 $adJob = Start-Job -ScriptBlock {
-                    param($ouPath, $adParams)
+                    param($ouPath, $adParams, $scope)
                     Import-Module ActiveDirectory
-                    Get-ADUser -Filter * -SearchBase $ouPath -Properties sAMAccountName, displayName, mail, department, title, manager, enabled, lastLogonDate, memberOf, distinguishedName, userPrincipalName, employeeID @adParams
-                } -ArgumentList $ouPath, $adParams
+                    Get-ADUser -Filter * -SearchBase $ouPath -SearchScope $scope -Properties sAMAccountName, displayName, mail, department, title, manager, enabled, lastLogonDate, memberOf, distinguishedName, userPrincipalName, employeeID @adParams
+                } -ArgumentList $ouPath, $adParams, $userSearchScope
                 
                 # Wait for job with timeout (configurable)
                 $timeout = $privilegeConfig.processingOptions.queryTimeoutSeconds
@@ -1332,7 +1684,7 @@ if (-not $GroupsOnly) {
                             if (-not $shouldExclude) {
                                 try {
                                     Write-Host "          Getting group details..." -ForegroundColor DarkGray
-                                    $group = Get-ADGroup -Identity $groupDN -Properties Description @adParams
+                                    $group = Get-ADGroup -Identity $groupDN -Properties Description, whenCreated @adParams
                                     Write-Host "          Group found: $($group.Name)" -ForegroundColor DarkGray
                                     
                                     $groupGuid = Get-SimpleObjectGuid $group $false
@@ -1343,6 +1695,7 @@ if (-not $GroupsOnly) {
                                     $privilegeGroup | Add-Member -MemberType NoteProperty -Name "GroupID" -Value $groupGuid
                                     $privilegeGroup | Add-Member -MemberType NoteProperty -Name "ReviewPackageID" -Value $reviewPackageID
                                     $privilegeGroup | Add-Member -MemberType NoteProperty -Name "Description" -Value (Get-SafeValue $group.Description)
+                                    $privilegeGroup | Add-Member -MemberType NoteProperty -Name "DateCreated" -Value (Get-SafeValue $group.whenCreated)
                                     
                                     $privilegeGroups += $privilegeGroup
                                     Write-Host "          Added privilege group record" -ForegroundColor DarkGray
@@ -1439,4 +1792,4 @@ Write-Host "Script execution completed." -ForegroundColor Gray
 # Stop transcript if it was started
 if ($TranscriptStarted) {
     try { Stop-Transcript | Out-Null } catch {}
-} 
+}
